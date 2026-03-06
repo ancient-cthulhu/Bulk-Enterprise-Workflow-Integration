@@ -104,7 +104,7 @@ def request(method: str, url: str, token: str, max_retries: int = 3, **kwargs) -
     raise RuntimeError(f"Failed after {max_retries} retries")
 
 def parse_link_next(link_header: str) -> Optional[str]:
-    # Minimal RFC5988 parsing for rel="next"
+    # RFC5988 parsing for rel="next"
     parts = [p.strip() for p in link_header.split(",")]
     for part in parts:
         if 'rel="next"' in part:
@@ -206,7 +206,6 @@ def veracode_request(method: str, endpoint: str, api_id: str, api_key: str, **kw
     base_url = "https://api.veracode.com"
     url = f"{base_url}{endpoint}"
     
-    # Use the official Veracode HMAC authentication plugin
     auth = RequestsAuthPluginVeracodeHMAC(api_key_id=api_id, api_key_secret=api_key)
     
     return requests.request(method, url, auth=auth, timeout=30, **kwargs)
@@ -462,7 +461,6 @@ def list_orgs_graphql(api_base: str, token: str, enterprise: str) -> Optional[Li
     """
     Try to list enterprise orgs using GraphQL API.
     Returns list of org logins or None if it fails.
-    This works on trial enterprises when REST API is blocked.
     """
     try:
         graphql_url = f"{api_base.replace('/api/v3', '')}/graphql"
@@ -525,7 +523,7 @@ def list_orgs(api_base: str, token: str, enterprise: Optional[str], orgs_file: O
     
     # Preferred: enterprise enumeration (GHEC)
     if enterprise:
-        # Try GraphQL first (works on trial enterprises and is more reliable)
+        # Try GraphQL first
         print(f"Attempting to discover orgs via enterprise GraphQL API: enterprise(slug: \"{enterprise}\")")
         try:
             orgs = list_orgs_graphql(api_base, token, enterprise)
