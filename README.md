@@ -108,7 +108,7 @@ repo
 workflow    # REQUIRED - Push workflow files to repositories
 ```
 **Critical:** The `workflow` scope is required when using `--import-repo` because the Veracode template includes workflow files. Without this scope, git push operations will be rejected.
- the
+
 ### For Enterprise Organization Discovery (--enterprise flag)
 ```
 read:org
@@ -143,6 +143,10 @@ admin:enterprise  # Enterprise management and org discovery
 read:enterprise   # Read enterprise data (if available)
 ```
 
+### Token Security
+
+The `GITHUB_TOKEN` is passed directly in the git remote URL for repository import operations (`https://{token}@github.com/...`). Store it as an environment variable — never hardcode it in the script or commit it to source control. In CI environments, use a GitHub Actions secret or equivalent secrets manager.
+
 ## Features
 
 ### Repository Management
@@ -151,8 +155,7 @@ read:enterprise   # Read enterprise data (if available)
 - Uses git CLI for fast, reliable mirroring
 - Falls back to manual instructions if git unavailable
 - **Automatically pushes customized `veracode.yml` configuration**
-- Adds the **teams** option to the *veracode-policy-scan.yml* and *veracode-sandbox-scan.yml* in *veracode/.github
-/workflows/*
+- Adds the **teams** option to the *veracode-policy-scan.yml* and *veracode-sandbox-scan.yml* in *veracode/.github/workflows/*
 
 ### App Installation
 - **Automated** (Enterprise only): Installs app via Enterprise API
@@ -333,14 +336,14 @@ All files created in `out/` directory:
 
 | File | Description |
 |------|-------------|
-| `audit_report.json` | Complete execution report with all details |
+| `audit_report.json` | Complete execution report with all details per org, written incrementally (crash-safe) |
 | `missing_veracode_repo.csv` | Orgs missing the veracode repository |
 | `missing_workflow_app.csv` | Orgs missing the workflow app |
 | `manual_install_links.csv` | **Clickable install links** (open in Excel) |
 
 ### Audit Report Tracking
 
-The `audit_report.json` file provides detailed tracking of all changes made to each organization:
+The `audit_report.json` file provides detailed tracking of all changes made to each organization. Each org entry is written immediately after processing — a crash mid-run will not lose completed results.
 
 **Example entry:**
 ```json
@@ -422,6 +425,11 @@ The script discovers organizations using a GraphQL-first approach:
 - Check token scopes at: https://github.com/settings/tokens
 - Required scopes: `read:org`, `read:enterprise` (for --enterprise flag)
 
+**Repo import fails on Windows:**
+- Ensure `GITHUB_TOKEN` is set in your environment before running
+- The token is used directly in the git remote URL — Git Credential Manager must not override it
+- If GCM is intercepting, run: `git config --global credential.helper ""` to disable it temporarily
+
 ## GitHub Enterprise Cloud (GHEC)
 
 ```bash
@@ -496,6 +504,7 @@ Links are pre-filled with org information for one-click installation.
 ## Security Notes
 - Secrets are encrypted using GitHub's public key API
 - Agent tokens are unique per organization
+- `GITHUB_TOKEN` is passed via environment variable — never hardcode in source
 - No secrets are logged or stored locally
 - Default mode is read-only (dry-run)
 - All changes require explicit `--apply` flag
