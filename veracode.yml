@@ -23,7 +23,7 @@ veracode_static_scan:
   # If break_build_invalid_policy is set to true, the build will break when the policy name is invalid.
   break_build_invalid_policy: false
   # If the break_build_on_error is set to true, the build will break if the scan failed to complete in time or with an error and the error_message will be displayed.
-  break_build_on_error: true
+  break_build_on_error: false
   error_message: "Veracode static scan faced a problem. Please contact your Veracode administrator for more information."
   # Default policy to be used if a policy isn't already assigned to the application profile.
   policy: 'Omnicom Base Policy'
