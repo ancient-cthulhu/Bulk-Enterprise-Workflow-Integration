@@ -53,7 +53,7 @@ This will:
 - Write `out/orgs.txt` - one org per line, ready to pass to `--orgs-file` or trim down for a targeted apply
 - Write `out/missing_veracode_repo.csv`, `out/missing_workflow_app.csv`, `out/manual_install_links.csv`
 - Write `out/teams_map.csv` - one row per org with a blank `teams` column, ready to fill in
-- If `--set-secrets` is also passed, checks and reports which orgs already have secrets configured
+- Check and report which orgs already have Veracode secrets configured
 
 
 #### Preparing for apply
@@ -156,6 +156,7 @@ The admin credentials are never stored anywhere. The service account credentials
 ```
 read:org
 repo
+admin:org    # required to check secrets state
 ```
 
 ### With --import-repo
