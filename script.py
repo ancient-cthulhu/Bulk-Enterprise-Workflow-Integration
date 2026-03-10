@@ -40,7 +40,6 @@ def headers(token: str) -> Dict[str, str]:
 
 
 def check_rate_limit(response: requests.Response) -> None:
-    """Warn or pause when approaching the GitHub API rate limit."""
     remaining = response.headers.get("X-RateLimit-Remaining")
     reset_time = response.headers.get("X-RateLimit-Reset")
 
@@ -58,8 +57,7 @@ def check_rate_limit(response: requests.Response) -> None:
             time.sleep(wait_seconds)
 
 
-def request(method: str, url: str, token: str, max_retries: int = 5, **kwargs) -> requests.Response:
-    """GitHub API request with 429 handling and exponential backoff on 5xx/network errors."""
+def request(method: str, url: str, token: str, max_retries: int = 3, **kwargs) -> requests.Response:
     for attempt in range(max_retries):
         try:
             r = requests.request(method, url, headers=headers(token), timeout=45, **kwargs)
@@ -75,7 +73,7 @@ def request(method: str, url: str, token: str, max_retries: int = 5, **kwargs) -
 
             if r.status_code >= 500:
                 if attempt < max_retries - 1:
-                    wait_seconds = min((2 ** attempt) * 2, 30)
+                    wait_seconds = (2 ** attempt) * 2
                     print(f"  [SERVER ERROR] {r.status_code}, waiting {wait_seconds}s (retry {attempt + 1}/{max_retries})...")
                     time.sleep(wait_seconds)
                     continue
@@ -85,7 +83,7 @@ def request(method: str, url: str, token: str, max_retries: int = 5, **kwargs) -
 
         except requests.exceptions.Timeout:
             if attempt < max_retries - 1:
-                wait_seconds = min((2 ** attempt) * 2, 30)
+                wait_seconds = (2 ** attempt) * 2
                 print(f"  [TIMEOUT] waiting {wait_seconds}s (retry {attempt + 1}/{max_retries})...")
                 time.sleep(wait_seconds)
                 continue
@@ -93,7 +91,7 @@ def request(method: str, url: str, token: str, max_retries: int = 5, **kwargs) -
 
         except requests.exceptions.RequestException as exc:
             if attempt < max_retries - 1:
-                wait_seconds = min((2 ** attempt) * 2, 30)
+                wait_seconds = (2 ** attempt) * 2
                 print(f"  [NETWORK ERROR] {str(exc)[:50]}, waiting {wait_seconds}s (retry {attempt + 1}/{max_retries})...")
                 time.sleep(wait_seconds)
                 continue
@@ -107,10 +105,9 @@ def veracode_request(
     endpoint: str,
     api_id: str,
     api_key: str,
-    max_retries: int = 5,
+    max_retries: int = 3,
     **kwargs,
 ) -> requests.Response:
-    """Veracode API request using HMAC signing, with the same retry/backoff logic as request()."""
     from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
 
     url = f"https://api.veracode.com{endpoint}"
@@ -130,7 +127,7 @@ def veracode_request(
 
             if r.status_code >= 500:
                 if attempt < max_retries - 1:
-                    wait_seconds = min((2 ** attempt) * 2, 30)
+                    wait_seconds = (2 ** attempt) * 2
                     print(f"  [VERACODE SERVER ERROR] {r.status_code}, waiting {wait_seconds}s (retry {attempt + 1}/{max_retries})...")
                     time.sleep(wait_seconds)
                     continue
@@ -140,7 +137,7 @@ def veracode_request(
 
         except requests.exceptions.Timeout:
             if attempt < max_retries - 1:
-                wait_seconds = min((2 ** attempt) * 2, 30)
+                wait_seconds = (2 ** attempt) * 2
                 print(f"  [VERACODE TIMEOUT] waiting {wait_seconds}s (retry {attempt + 1}/{max_retries})...")
                 time.sleep(wait_seconds)
                 continue
@@ -148,7 +145,7 @@ def veracode_request(
 
         except requests.exceptions.RequestException as exc:
             if attempt < max_retries - 1:
-                wait_seconds = min((2 ** attempt) * 2, 30)
+                wait_seconds = (2 ** attempt) * 2
                 print(f"  [VERACODE NETWORK ERROR] {str(exc)[:50]}, waiting {wait_seconds}s (retry {attempt + 1}/{max_retries})...")
                 time.sleep(wait_seconds)
                 continue
@@ -158,7 +155,6 @@ def veracode_request(
 
 
 def parse_link_next(link_header: str) -> Optional[str]:
-    """Parse a GitHub RFC5988 Link header and return the 'next' page URL if present."""
     for part in [p.strip() for p in link_header.split(",")]:
         if 'rel="next"' in part:
             left = part.split(";")[0].strip()
@@ -168,7 +164,6 @@ def parse_link_next(link_header: str) -> Optional[str]:
 
 
 def paginate_list(url: str, token: str, params: Optional[dict] = None) -> List[dict]:
-    """Fetch all pages of a GitHub list endpoint and return the combined results."""
     out: List[dict] = []
     while url:
         r = request("GET", url, token, params=params)
@@ -189,7 +184,6 @@ def paginate_list(url: str, token: str, params: Optional[dict] = None) -> List[d
 # ---------------------------------------------------------------------------
 
 def write_csv(path: Path, header: List[str], rows: List[List[str]]) -> None:
-    """Write a CSV file, quoting all fields to safely handle special characters in org names."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
@@ -198,28 +192,18 @@ def write_csv(path: Path, header: List[str], rows: List[List[str]]) -> None:
 
 
 def write_report_entry(report_path: Path, entry: Dict[str, Any]) -> None:
-    """Incrementally append an org result to audit_report.json.
-
-    Each entry is written immediately after processing so a mid-run crash
-    does not lose previously completed results.
-    """
     if not report_path.exists():
         report_path.write_text("[\n" + json.dumps(entry, indent=2) + "\n]\n", encoding="utf-8")
         return
     with report_path.open("r+b") as f:
         f.seek(0, 2)
         size = f.tell()
-        # Read last 4 bytes to handle both LF (\n) and CRLF (\r\n) line endings
-        tail_size = min(size, 4)
-        f.seek(size - tail_size)
-        tail = f.read(tail_size)
-        # Strip trailing whitespace/newlines to find the closing bracket position
-        stripped = tail.rstrip(b"\r\n ")
-        if stripped.endswith(b"]"):
-            cut_pos = size - tail_size + len(stripped) - 1
-            f.seek(cut_pos)
-            f.truncate()
-            f.write((",\n" + json.dumps(entry, indent=2) + "\n]\n").encode("utf-8"))
+        if size >= 2:
+            f.seek(size - 2)
+            if f.read(2) == b"]\n":
+                f.seek(size - 2)
+                f.truncate()
+                f.write((",\n" + json.dumps(entry, indent=2) + "\n]\n").encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +211,6 @@ def write_report_entry(report_path: Path, entry: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 def check_git_available() -> bool:
-    """Return True if the git CLI is available on PATH."""
     try:
         result = subprocess.run(["git", "--version"], capture_output=True, timeout=10)
         return result.returncode == 0
@@ -240,10 +223,7 @@ def git_mirror_import(
     target_org: str,
     target_repo: str,
     token: str,
-    web_base: str = "https://github.com",
-    git_timeout: int = 300,
 ) -> Tuple[bool, str]:
-    """Bare-clone source_url and mirror-push to the target GitHub repo."""
     temp_dir: Optional[str] = None
 
     try:
@@ -252,17 +232,16 @@ def git_mirror_import(
 
         clone_result = subprocess.run(
             ["git", "clone", "--bare", source_url, bare_repo],
-            capture_output=True, text=True, timeout=git_timeout,
+            capture_output=True, text=True, timeout=300,
         )
         if clone_result.returncode != 0:
             return False, f"Clone failed: {clone_result.stderr}"
 
-        host = web_base.rstrip("/").replace("https://", "").replace("http://", "")
-        target_url = f"https://{token}@{host}/{target_org}/{target_repo}.git"
+        target_url = f"https://{token}@github.com/{target_org}/{target_repo}.git"
 
         push_result = subprocess.run(
             ["git", "-C", bare_repo, "push", "--mirror", target_url],
-            capture_output=True, text=True, timeout=git_timeout,
+            capture_output=True, text=True, timeout=300,
         )
         if push_result.returncode != 0:
             return False, f"Push failed: {push_result.stderr}"
@@ -285,66 +264,62 @@ def git_mirror_import(
 # Veracode SCA workspace and agent helpers
 # ---------------------------------------------------------------------------
 
+def _find_workspace_by_name(org_name: str, api_id: str, api_key: str) -> Optional[str]:
+    """Walk all pages of GET /v3/workspaces using filter[workspace] and return the workspace UUID."""
+    page = 0
+    while True:
+        r = veracode_request(
+            "GET", "/srcclr/v3/workspaces",
+            api_id, api_key,
+            params={"filter[workspace]": org_name, "size": 100, "page": page},
+        )
+        if r.status_code == 401:
+            print("  [ERROR] Veracode authentication failed - check credentials")
+            return None
+        if r.status_code == 403:
+            print("  [ERROR] Veracode permission denied - insufficient access")
+            return None
+        if r.status_code != 200:
+            print(f"  [ERROR] Failed to list workspaces: {r.status_code} - {r.text[:200]}")
+            return None
+
+        body = r.json()
+        for ws in body.get("_embedded", {}).get("workspaces", []):
+            if ws.get("name") == org_name:
+                return ws.get("id")
+
+        page_meta = body.get("page", {})
+        total_pages = page_meta.get("total_pages", 1)
+        if page >= total_pages - 1:
+            break
+        page += 1
+
+    return None
+
+
 def create_veracode_workspace(org_name: str, api_id: str, api_key: str) -> Optional[str]:
-    """Return the workspace ID for org_name, creating it if it does not exist."""
+    """Return the workspace UUID for org_name, creating it if it does not exist.
+
+    POST /v3/workspaces returns a ResponseEntity envelope with no workspace ID in the body.
+    The UUID is resolved via a follow-up GET with filter[workspace]=name.
+    """
     try:
-        page = 1
-        while True:
-            r = veracode_request("GET", f"/srcclr/v3/workspaces?page={page}&size=100", api_id, api_key)
-
-            if r.status_code == 401:
-                print("  [ERROR] Veracode authentication failed — check credentials")
-                return None
-            if r.status_code == 403:
-                print("  [ERROR] Veracode permission denied — insufficient access")
-                return None
-            if r.status_code != 200:
-                break
-
-            data = r.json()
-            for ws in data.get("_embedded", {}).get("workspaces", []):
-                if ws.get("name") == org_name:
-                    return ws.get("id")
-
-            page_info = data.get("page", {})
-            total_pages = page_info.get("totalPages", 1)
-            if page >= total_pages:
-                break
-            page += 1
+        existing_id = _find_workspace_by_name(org_name, api_id, api_key)
+        if existing_id:
+            return existing_id
 
         r = veracode_request("POST", "/srcclr/v3/workspaces", api_id, api_key, json={"name": org_name})
-
-        if r.status_code in (200, 201):
-            # some API versions return 201 with empty body - re-fetch by name
-            if not r.content or not r.content.strip():
-                page = 1
-                while True:
-                    r2 = veracode_request("GET", f"/srcclr/v3/workspaces?page={page}&size=100", api_id, api_key)
-                    if r2.status_code != 200:
-                        print("  [ERROR] Workspace created but could not re-fetch ID")
-                        return None
-                    data2 = r2.json()
-                    for ws in data2.get("_embedded", {}).get("workspaces", []):
-                        if ws.get("name") == org_name:
-                            return ws.get("id")
-                    page_info = data2.get("page", {})
-                    if page >= page_info.get("totalPages", 1):
-                        break
-                    page += 1
-                print("  [ERROR] Workspace created but ID not found on re-fetch")
-                return None
-            try:
-                ws_id = r.json().get("id")
-                if ws_id:
-                    return ws_id
-                print("  [ERROR] Workspace created but no ID in response")
-                return None
-            except json.JSONDecodeError:
-                print("  [ERROR] Failed to parse workspace response")
-                return None
-        else:
-            print(f"  [ERROR] Failed to create workspace: {r.status_code}")
+        if r.status_code not in (200, 201):
+            print(f"  [ERROR] Failed to create workspace: {r.status_code} - {r.text[:200]}")
             return None
+
+        time.sleep(1)
+        workspace_id = _find_workspace_by_name(org_name, api_id, api_key)
+        if not workspace_id:
+            print(f"  [ERROR] Workspace created but not found on follow-up lookup for: {org_name}")
+            return None
+
+        return workspace_id
 
     except Exception as exc:
         print(f"  [ERROR] create_veracode_workspace: {exc}")
@@ -352,7 +327,11 @@ def create_veracode_workspace(org_name: str, api_id: str, api_key: str) -> Optio
 
 
 def list_veracode_agents(workspace_id: str, api_id: str, api_key: str) -> Optional[List[dict]]:
-    """Return the list of agents in a workspace, or None on failure."""
+    """Return the list of AgentSummary objects for a workspace, or None on failure.
+
+    GET /v3/workspaces/{id}/agents returns Resources«AgentSummary»:
+    { _embedded: [ {id, name, ...} ] } - flat list, no pagination.
+    """
     try:
         r = veracode_request("GET", f"/srcclr/v3/workspaces/{workspace_id}/agents", api_id, api_key)
         if r.status_code == 200:
@@ -381,21 +360,39 @@ def create_veracode_agent_token(
     api_id: str,
     api_key: str,
 ) -> Optional[str]:
-    """Create a CLI agent token for the workspace, replacing any existing agent of the same name."""
+    """Return an agent access_token for the workspace.
+
+    If an agent with the expected name already exists, regenerate its token via
+    token:regenerate (invalidates old tokens, returns fresh access_token).
+    Otherwise create a new agent - POST /v3/workspaces/{id}/agents returns CreatedAgent
+    which embeds token.access_token directly.
+    """
     try:
         suffix = "-agt"
         max_org_len = 20 - len(suffix)
         truncated_org = org_name[:max_org_len]
         if not truncated_org[0].isalpha():
-            truncated_org = "gh" + truncated_org[: max_org_len - 2]
+            truncated_org = "gh" + truncated_org[:max_org_len - 2]
         agent_name = f"{truncated_org}{suffix}"
 
         existing_agents = list_veracode_agents(workspace_id, api_id, api_key)
         if existing_agents:
             for agent in existing_agents:
                 if agent.get("name") == agent_name:
-                    if not delete_veracode_agent(workspace_id, agent.get("id"), api_id, api_key):
-                        print("  [WARNING] Failed to delete old agent, attempting to create new one anyway")
+                    agent_id = agent.get("id")
+                    regen = veracode_request(
+                        "POST",
+                        f"/srcclr/v3/workspaces/{workspace_id}/agents/{agent_id}/token:regenerate",
+                        api_id, api_key,
+                    )
+                    if regen.status_code == 200:
+                        access_token = regen.json().get("access_token")
+                        if access_token:
+                            return access_token
+                        print("  [ERROR] token:regenerate succeeded but no access_token in response")
+                        return None
+                    print(f"  [ERROR] token:regenerate failed: {regen.status_code} - {regen.text[:200]}")
+                    return None
 
         r = veracode_request(
             "POST",
@@ -403,23 +400,26 @@ def create_veracode_agent_token(
             api_id, api_key,
             json={"name": agent_name, "agent_type": "CLI"},
         )
-
-        if r.status_code in (200, 201):
-            if not r.content:
-                print("  [ERROR] Agent created but response is empty")
-                return None
-            try:
-                access_token = r.json().get("token", {}).get("access_token")
-                if access_token:
-                    return access_token
-                print("  [ERROR] Agent created but no access_token in response")
-                return None
-            except json.JSONDecodeError:
-                print("  [ERROR] Failed to parse agent response")
-                return None
-        else:
+        if r.status_code != 200:
             print(f"  [ERROR] Failed to create agent: {r.status_code} - {r.text[:200]}")
             return None
+
+        if not r.content:
+            print("  [ERROR] Agent POST returned empty body")
+            return None
+
+        try:
+            agent_body = r.json()
+        except json.JSONDecodeError:
+            print("  [ERROR] Failed to parse agent POST response")
+            return None
+
+        access_token = agent_body.get("token", {}).get("access_token")
+        if access_token:
+            return access_token
+
+        print(f"  [ERROR] Agent created but no token.access_token in response: {agent_body}")
+        return None
 
     except Exception as exc:
         print(f"  [ERROR] create_veracode_agent_token: {exc}")
@@ -431,7 +431,6 @@ def create_veracode_agent_token(
 # ---------------------------------------------------------------------------
 
 def get_org_public_key(api_base: str, org: str, token: str) -> Optional[Tuple[str, str]]:
-    """Return (key_id, public_key) needed to encrypt a secret for this org, or None."""
     try:
         r = request("GET", f"{api_base}/orgs/{org}/actions/secrets/public-key", token)
         if r.status_code == 200:
@@ -443,7 +442,6 @@ def get_org_public_key(api_base: str, org: str, token: str) -> Optional[Tuple[st
 
 
 def encrypt_secret(public_key: str, secret_value: str) -> str:
-    """Encrypt a secret value using the org's NaCl public key (required by the GitHub API)."""
     from base64 import b64encode
     from nacl import encoding, public
 
@@ -454,7 +452,6 @@ def encrypt_secret(public_key: str, secret_value: str) -> str:
 
 
 def secret_exists(api_base: str, org: str, token: str, secret_name: str) -> bool:
-    """Return True if the named org-level Actions secret already exists."""
     try:
         r = request("GET", f"{api_base}/orgs/{org}/actions/secrets/{secret_name}", token)
         if r.status_code == 200:
@@ -478,7 +475,6 @@ def set_org_secret(
     secret_name: str,
     secret_value: str,
 ) -> bool:
-    """Encrypt and set an org-level Actions secret. Returns True on success."""
     try:
         key_info = get_org_public_key(api_base, org, token)
         if not key_info:
@@ -506,18 +502,13 @@ def set_veracode_secrets(
     api_base: str,
     org: str,
     github_token: str,
-    sa_api_id: str,
-    sa_api_key: str,
+    veracode_sa_api_id: str,
+    veracode_sa_api_key: str,
     veracode_agent_token: str,
 ) -> Tuple[bool, Dict[str, str]]:
-    """Set VERACODE_API_ID, VERACODE_API_KEY, and VERACODE_AGENT_TOKEN for an org.
-
-    sa_api_id/sa_api_key are the service account credentials stored as secrets.
-    Skips secrets that already exist. Returns (all_ok, per-secret status dict).
-    """
     secrets_to_set = {
-        "VERACODE_API_ID": sa_api_id,
-        "VERACODE_API_KEY": sa_api_key,
+        "VERACODE_API_ID": veracode_sa_api_id,
+        "VERACODE_API_KEY": veracode_sa_api_key,
         "VERACODE_AGENT_TOKEN": veracode_agent_token,
     }
     results: Dict[str, str] = {}
@@ -530,16 +521,11 @@ def set_veracode_secrets(
             if ok:
                 time.sleep(0.5)
                 verified = secret_exists(api_base, org, github_token, secret_name)
-                if not verified:
-                    print(f"  [WARNING] {secret_name} was set but could not be verified — check org permissions")
                 results[secret_name] = "set" if verified else "set_unverified"
             else:
                 results[secret_name] = "failed"
 
     all_ok = all(v in ("set", "exists") for v in results.values())
-    unverified = [k for k, v in results.items() if v == "set_unverified"]
-    if unverified:
-        print(f"  [WARNING] Secrets set but unverified (may still be ok): {', '.join(unverified)}")
     return all_ok, results
 
 
@@ -548,14 +534,12 @@ def set_veracode_secrets(
 # ---------------------------------------------------------------------------
 
 def list_orgs_graphql(api_base: str, token: str, enterprise: str) -> Optional[List[str]]:
-    """Enumerate all orgs in a GitHub Enterprise via GraphQL. Returns logins or None on failure."""
     try:
-        if "api.github.com" in api_base:
-            graphql_url = "https://api.github.com/graphql"
-        else:
-            # GHES REST base is .../api/v3 but GraphQL lives at .../api/graphql
-            graphql_base = re.sub(r"/api/v3$", "/api", api_base.rstrip("/"))
-            graphql_url = f"{graphql_base}/graphql"
+        graphql_url = (
+            "https://api.github.com/graphql"
+            if "api.github.com" in api_base
+            else f"{api_base.rstrip('/')}/graphql"
+        )
 
         query = """
         query($enterprise: String!, $cursor: String) {
@@ -598,79 +582,30 @@ def list_orgs_graphql(api_base: str, token: str, enterprise: str) -> Optional[Li
         return None
 
 
-def load_orgs_file(orgs_file: str) -> List[str]:
-    """Read org names from a file, skipping blank lines and # comments."""
-    with open(orgs_file, encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-
-
 def list_orgs(
     api_base: str,
     token: str,
     enterprise: Optional[str],
     orgs_file: Optional[str],
 ) -> List[str]:
-    """Resolve the list of orgs to process.
-
-    Discovery order:
-      1. --orgs-file alone          - use file list directly
-      2. --enterprise alone         - discover all orgs via GraphQL
-      3. --enterprise + --orgs-file - discover via GraphQL, then filter to file list
-      4. Neither flag               - fall back to /user/orgs
-    """
-    # orgs-file only - use it directly, no API discovery needed
-    if orgs_file and not enterprise:
-        try:
-            print(f"Reading orgs from file: {orgs_file}")
-            orgs = load_orgs_file(orgs_file)
-            if orgs:
-                print(f"[OK] Found {len(orgs)} orgs from file")
-                return orgs
-            raise RuntimeError(f"File '{orgs_file}' contains no valid org names")
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(f"File read failed: {exc}")
+    errors: List[str] = []
 
     if enterprise:
         print(f'Discovering orgs via enterprise GraphQL: enterprise(slug: "{enterprise}")')
         try:
-            discovered = list_orgs_graphql(api_base, token, enterprise)
-            if not discovered:
-                print(f"\n[ERROR] Enterprise GraphQL returned 0 organizations", file=sys.stderr)
-                for line in [
-                    f"Enterprise slug '{enterprise}' may be wrong, or token lacks 'read:enterprise' scope.",
-                    "Verify: gh auth status",
-                    f"Check:  https://github.com/enterprises/{enterprise}",
-                    "Retry without --enterprise to see accessible orgs: python script.py --dry-run",
-                ]:
-                    print(f"  {line}", file=sys.stderr)
-                raise RuntimeError(f"Enterprise '{enterprise}' returned no organizations")
-
-            print(f"[OK] Found {len(discovered)} orgs via GraphQL")
-
-            # filter to orgs-file list if provided
-            if orgs_file:
-                try:
-                    file_orgs = load_orgs_file(orgs_file)
-                    if not file_orgs:
-                        raise RuntimeError(f"File '{orgs_file}' contains no valid org names")
-                    discovered_set = set(discovered)
-                    filtered = [o for o in file_orgs if o in discovered_set]
-                    skipped = [o for o in file_orgs if o not in discovered_set]
-                    if skipped:
-                        print(f"  [WARNING] {len(skipped)} org(s) in file not found in enterprise and will be skipped: {', '.join(skipped)}")
-                    if not filtered:
-                        raise RuntimeError("No orgs from --orgs-file were found in the enterprise org list")
-                    print(f"[OK] Filtered to {len(filtered)} orgs from {orgs_file}")
-                    return filtered
-                except RuntimeError:
-                    raise
-                except Exception as exc:
-                    raise RuntimeError(f"Failed to apply --orgs-file filter: {exc}")
-
-            return discovered
-
+            orgs = list_orgs_graphql(api_base, token, enterprise)
+            if orgs:
+                print(f"[OK] Found {len(orgs)} orgs via GraphQL")
+                return orgs
+            print(f"\n[ERROR] Enterprise GraphQL returned 0 organizations", file=sys.stderr)
+            for line in [
+                f"Enterprise slug '{enterprise}' may be wrong, or token lacks 'read:enterprise' scope.",
+                "Verify: gh auth status",
+                f"Check:  https://github.com/enterprises/{enterprise}",
+                "Retry without --enterprise to see accessible orgs: python script.py --dry-run",
+            ]:
+                print(f"  {line}", file=sys.stderr)
+            raise RuntimeError(f"Enterprise '{enterprise}' returned no organizations")
         except RuntimeError:
             raise
         except requests.exceptions.RequestException as exc:
@@ -678,7 +613,6 @@ def list_orgs(
         except Exception as exc:
             raise RuntimeError(f"Enterprise API failed: {exc}")
 
-    # fallback: /user/orgs
     try:
         print("Discovering orgs via /user/orgs (all orgs the token user belongs to)")
         org_objs = paginate_list(f"{api_base}/user/orgs", token, params={"per_page": 100})
@@ -686,15 +620,30 @@ def list_orgs(
         if orgs:
             print(f"[OK] Found {len(orgs)} orgs via user API")
             return orgs
+        errors.append("User API returned no orgs")
     except Exception as exc:
-        pass
+        errors.append(f"User API failed: {exc}")
 
-    print("\n[ERROR] Unable to determine org list.", file=sys.stderr)
+    if orgs_file:
+        try:
+            print(f"Reading orgs from file: {orgs_file}")
+            with open(orgs_file, encoding="utf-8") as f:
+                orgs = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+            if orgs:
+                print(f"[OK] Found {len(orgs)} orgs from file")
+                return orgs
+            errors.append(f"File '{orgs_file}' contains no valid org names")
+        except Exception as exc:
+            errors.append(f"File read failed: {exc}")
+
+    print("\n[ERROR] Unable to determine org list. Tried:", file=sys.stderr)
+    for i, error in enumerate(errors, 1):
+        print(f"   {i}. {error}", file=sys.stderr)
     print("\nTroubleshooting:", file=sys.stderr)
-    print("  • Ensure GITHUB_TOKEN is set with a valid token", file=sys.stderr)
-    print("  • Verify token has 'read:org' scope", file=sys.stderr)
-    print("  • Provide --enterprise <slug> if using GHEC", file=sys.stderr)
-    print("  • Provide --orgs-file <path> with one org per line", file=sys.stderr)
+    print("  - Ensure GITHUB_TOKEN is set with a valid token", file=sys.stderr)
+    print("  - Verify token has 'read:org' scope", file=sys.stderr)
+    print("  - Provide --enterprise <slug> if using GHEC", file=sys.stderr)
+    print("  - Provide --orgs-file <path> with one org per line", file=sys.stderr)
     raise RuntimeError("Unable to determine org list. See errors above.")
 
 
@@ -712,7 +661,6 @@ def repo_exists(api_base: str, org: str, repo: str, token: str) -> bool:
 
 
 def repo_is_empty(api_base: str, org: str, repo: str, token: str) -> bool:
-    """Return True if the repo has no commits (409 = empty repo, or commits list is empty)."""
     try:
         r = request("GET", f"{api_base}/repos/{org}/{repo}/commits", token, params={"per_page": 1})
         if r.status_code == 409:
@@ -737,7 +685,6 @@ def create_repo(api_base: str, org: str, repo: str, token: str) -> None:
 
 
 def check_main_branch_exists(api_base: str, org: str, repo: str, token: str) -> bool:
-    """Return True if the main branch exists (used to confirm a successful import)."""
     try:
         r = request("GET", f"{api_base}/repos/{org}/{repo}/branches/main", token)
         return r.status_code == 200
@@ -745,17 +692,39 @@ def check_main_branch_exists(api_base: str, org: str, repo: str, token: str) -> 
         return False
 
 
+def get_import_status(api_base: str, org: str, repo: str, token: str) -> dict:
+    r = request("GET", f"{api_base}/repos/{org}/{repo}/import", token)
+    if r.status_code == 200:
+        return r.json()
+    raise RuntimeError(f"{org}/{repo}: import status failed {r.status_code} {r.text}")
+
+
+def wait_for_import(
+    api_base: str,
+    org: str,
+    repo: str,
+    token: str,
+    timeout_s: int = 900,
+    poll_s: int = 5,
+) -> dict:
+    deadline = time.time() + timeout_s
+    last: dict = {}
+    while time.time() < deadline:
+        last = get_import_status(api_base, org, repo, token)
+        status = (last.get("status") or "").lower()
+        if status in ("complete", "succeeded"):
+            return last
+        if status in ("failed", "error"):
+            raise RuntimeError(f"{org}/{repo}: import failed: {last}")
+        time.sleep(poll_s)
+    raise RuntimeError(f"{org}/{repo}: import timed out; last={last}")
+
+
 # ---------------------------------------------------------------------------
 # Workflow file injection
 # ---------------------------------------------------------------------------
 
-def _inject_teams_regex(content: str, teams_value: str) -> Tuple[str, bool]:
-    """Inject 'teams: "<teams_value>"' as the first param in every uploadandscan-action with: block.
-
-    teams_value can be a single name or a comma-separated list (e.g. "team-a,team-b").
-    Handles steps with and without a `name:` field preceding `uses:`.
-    Idempotent — skips blocks that already contain a `teams:` key.
-    """
+def _inject_teams_regex(content: str, org: str) -> Tuple[str, bool]:
     pattern = re.compile(
         r"([ \t]*(?:-[ \t]+)?uses:[ \t]+veracode/(?:veracode-)?uploadandscan-action@[^\n]+\n"
         r"(?:[ \t]+[^\n]+\n)*?"
@@ -774,29 +743,18 @@ def _inject_teams_regex(content: str, teams_value: str) -> Tuple[str, bool]:
         first_param = body.splitlines()[0]
         indent = len(first_param) - len(first_param.lstrip())
         changed = True
-        return header + " " * indent + f'teams: "{teams_value}"\n' + body
+        return header + " " * indent + f'teams: "{org}"\n' + body
 
     return pattern.sub(replacer, content), changed
 
 
-def inject_teams_into_workflows(
-    api_base: str,
-    org: str,
-    repo: str,
-    token: str,
-    teams_value: Optional[str] = None,
-) -> Tuple[bool, str]:
-    """Inject the teams parameter into the policy and sandbox scan workflow files.
-
-    teams_value overrides the default of using the org name as the team.
-    """
+def inject_teams_into_workflows(api_base: str, org: str, repo: str, token: str, teams_value: str) -> Tuple[bool, str]:
     from base64 import b64decode, b64encode
 
     workflow_files = [
         ".github/workflows/veracode-sandbox-scan.yml",
         ".github/workflows/veracode-policy-scan.yml",
     ]
-    effective_teams = teams_value or org
     modified_count = 0
 
     for workflow_path in workflow_files:
@@ -810,7 +768,7 @@ def inject_teams_into_workflows(
         raw_content = b64decode(file_data.get("content", "")).decode("utf-8")
 
         try:
-            new_content, was_changed = _inject_teams_regex(raw_content, effective_teams)
+            new_content, was_changed = _inject_teams_regex(raw_content, teams_value)
         except Exception as exc:
             print(f"  [{org}] Regex injection error for {workflow_path}: {exc}")
             continue
@@ -836,10 +794,6 @@ def inject_teams_into_workflows(
 
 
 def inject_veracode_yml(api_base: str, org: str, repo: str, token: str) -> Tuple[bool, str]:
-    """Replace the repo's veracode.yml with the local custom template.
-
-    The original is preserved as default-veracode.yml for reference.
-    """
     from base64 import b64decode, b64encode
 
     template_path = Path(__file__).parent / "veracode.yml"
@@ -897,27 +851,17 @@ def ensure_veracode_repo_imported(
     token: str,
     do_apply: bool,
     auto_import: bool = False,
-    set_teams: bool = False,
     teams_value: Optional[str] = None,
     import_timeout_s: int = 900,
     import_poll_s: int = 5,
-    web_base: str = "https://github.com",
-    git_timeout: int = 300,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Ensure the Veracode integration repo exists and is populated.
-
-    Returns (present, details). In dry-run mode (do_apply=False) only reports status.
-    teams_value overrides the org name when injecting the teams parameter.
-    """
     details: Dict[str, Any] = {"repo": INTEGRATION_REPO_NAME}
     exists = repo_exists(api_base, org, INTEGRATION_REPO_NAME, token)
 
     if exists and not repo_is_empty(api_base, org, INTEGRATION_REPO_NAME, token):
         details["status"] = "repo_exists"
-        if set_teams:
-            _ok, teams_msg = inject_teams_into_workflows(
-                api_base, org, INTEGRATION_REPO_NAME, token, teams_value=teams_value
-            )
+        if teams_value:
+            _ok, teams_msg = inject_teams_into_workflows(api_base, org, INTEGRATION_REPO_NAME, token, teams_value)
             details["teams_injection"] = teams_msg
         return True, details
 
@@ -935,10 +879,10 @@ def ensure_veracode_repo_imported(
 
     if auto_import:
         if not check_git_available():
-            print(f"  [{org}] Git CLI not available — skipping auto import")
+            print(f"  [{org}] Git CLI not available - skipping auto import")
             auto_import = False
         else:
-            ok, message = git_mirror_import(INTEGRATION_SOURCE_URL, org, INTEGRATION_REPO_NAME, token, web_base=web_base, git_timeout=git_timeout)
+            ok, message = git_mirror_import(INTEGRATION_SOURCE_URL, org, INTEGRATION_REPO_NAME, token)
             if ok:
                 time.sleep(2)
                 if check_main_branch_exists(api_base, org, INTEGRATION_REPO_NAME, token):
@@ -946,10 +890,10 @@ def ensure_veracode_repo_imported(
                     details["status"] = "repo_created_and_imported"
                     details["import_method"] = "git_cli_auto"
                     details["veracode_yml_injected"] = yml_action if yml_ok else "failed"
-                    if set_teams:
+                    if teams_value:
                         time.sleep(1)
                         _ok, teams_msg = inject_teams_into_workflows(
-                            api_base, org, INTEGRATION_REPO_NAME, token, teams_value=teams_value
+                            api_base, org, INTEGRATION_REPO_NAME, token, teams_value
                         )
                         details["teams_injection"] = teams_msg
                     return True, details
@@ -965,9 +909,9 @@ def ensure_veracode_repo_imported(
 
     details["status"] = "repo_created_manual_import_required"
     details["import_instructions"] = {
-        "web_importer_url": f"{web_base.rstrip('/')}/{org}/{INTEGRATION_REPO_NAME}/import",
+        "web_importer_url": f"https://github.com/{org}/{INTEGRATION_REPO_NAME}/import",
         "source_url": INTEGRATION_SOURCE_URL,
-        "note": "Manual import required — use GitHub web UI",
+        "note": "Manual import required - use GitHub web UI",
     }
     return False, details
 
@@ -988,7 +932,6 @@ def find_app_installation(api_base: str, org: str, token: str, app_slug: str) ->
 
 
 def get_org_id(api_base: str, org: str, token: str) -> Optional[int]:
-    """Return the numeric org ID (used to generate direct app install links)."""
     try:
         r = request("GET", f"{api_base}/orgs/{org}", token)
         if r.status_code == 200:
@@ -1011,7 +954,6 @@ def enterprise_install(
     token: str,
     client_id: str,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Attempt automated app installation via the enterprise API. Returns (ok, result_dict)."""
     url = f"{api_base}/enterprises/{enterprise}/apps/organizations/{org}/installations"
     payload: Dict[str, Any] = {"client_id": client_id, "repository_selection": "all"}
     r = request("POST", url, token, json=payload)
@@ -1040,7 +982,6 @@ def ensure_app_installed(
     enterprise: Optional[str],
     client_id: Optional[str],
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Check and optionally install the Veracode Workflow App for an org."""
     inst = find_app_installation(api_base, org, token, APP_SLUG)
     if inst:
         return True, {
@@ -1078,41 +1019,38 @@ def ensure_app_installed(
 
 
 # ---------------------------------------------------------------------------
-# Teams map helpers (--set-teams-file)
+# Teams map helpers
 # ---------------------------------------------------------------------------
 
-def generate_teams_map(orgs: List[str], output_path: Path) -> None:
-    """Write a teams_map.csv template for the user to fill in.
+def load_teams_map(teams_file: str) -> Dict[str, str]:
+    teams_map: Dict[str, str] = {}
+    try:
+        with open(teams_file, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                org_name = (row.get("org") or "").strip()
+                teams_value = (row.get("teams") or "").strip().strip('"')
+                if org_name:
+                    teams_map[org_name] = teams_value
+        print(f"[teams-map] Loaded {len(teams_map)} org->teams mappings from {teams_file}")
+    except Exception as exc:
+        print(f"[ERROR] Failed to load teams file '{teams_file}': {exc}", file=sys.stderr)
+        sys.exit(1)
+    return teams_map
 
-    Columns: org, teams
-    The teams column accepts a comma-separated list of Veracode team names.
-    Leave a row's teams column blank to skip injection for that org.
-    """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="", encoding="utf-8") as f:
+
+def write_teams_map_csv(path: Path, orgs: List[str]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
         writer.writerow(["org", "teams"])
         for org in orgs:
             writer.writerow([org, ""])
-    print(f"[teams-map] Generated {output_path} with {len(orgs)} orgs")
-    print(f"[teams-map] Fill in the 'teams' column (comma-separated team names), then re-run:")
-    print(f"[teams-map]   python script.py --apply --set-teams-file {output_path}")
 
 
-def load_teams_map(path: str) -> Dict[str, str]:
-    """Load a teams_map.csv and return {org: teams_value}.
-
-    Orgs with a blank teams column are excluded — teams injection is skipped for them.
-    """
-    teams_map: Dict[str, str] = {}
-    with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            org = (row.get("org") or "").strip()
-            teams = (row.get("teams") or "").strip()
-            if org and teams:
-                teams_map[org] = teams
-    return teams_map
+def write_orgs_txt(path: Path, orgs: List[str]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for org in orgs:
+            f.write(org + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1129,18 +1067,17 @@ def main() -> None:
 
     ap.add_argument("--import-repo", action="store_true",
                     help="[apply] Create and import the 'veracode' repo if missing.")
+
+    teams_group = ap.add_mutually_exclusive_group()
+    teams_group.add_argument("--set-teams-auto", action="store_true",
+                             help="[apply] Inject teams parameter using the org name.")
+    teams_group.add_argument("--set-teams-file", metavar="FILE",
+                             help="[apply] CSV file (org,teams) for per-org team injection.")
+
     ap.add_argument("--install-app", action="store_true",
                     help="[apply] Attempt enterprise installation of the Veracode Workflow App.")
     ap.add_argument("--set-secrets", action="store_true",
                     help="[apply] Set VERACODE_API_ID, VERACODE_API_KEY, VERACODE_AGENT_TOKEN secrets.")
-    ap.add_argument("--set-teams-auto", action="store_true",
-                    help="[apply] Inject teams parameter using the org name as the team value.")
-    ap.add_argument("--set-teams-file", metavar="FILE",
-                    help=(
-                        "[apply] Read a teams_map.csv and inject per-org team values into workflow files. "
-                        "teams_map.csv is automatically generated on every dry-run. "
-                        "Teams column accepts comma-separated team names."
-                    ))
 
     ap.add_argument("--enterprise", help="GitHub Enterprise slug.")
     ap.add_argument("--app-client-id", help="GitHub App client ID (required for --install-app).")
@@ -1158,8 +1095,6 @@ def main() -> None:
                     help="Repo import timeout in seconds (default: 900).")
     ap.add_argument("--import-poll", type=int, default=5,
                     help="Repo import poll interval in seconds (default: 5).")
-    ap.add_argument("--git-timeout", type=int, default=300,
-                    help="Timeout in seconds for each git clone/push operation (default: 300).")
 
     ap.add_argument("--skip-to", help="Skip all orgs before this one and start from here.")
     ap.add_argument("--continue", dest="resume", action="store_true",
@@ -1169,11 +1104,6 @@ def main() -> None:
 
     if not args.dry_run and not args.apply:
         args.dry_run = True
-
-    if args.apply and args.set_teams_file is None and "--set-teams-file" in sys.argv:
-        print("ERROR: --set-teams-file requires a FILE path in apply mode.", file=sys.stderr)
-        print("  Example: --apply --set-teams-file out/teams_map.csv", file=sys.stderr)
-        sys.exit(1)
 
     if args.apply and args.set_secrets:
         try:
@@ -1203,33 +1133,39 @@ def main() -> None:
     veracode_sa_api_key = env("VERACODE_SA_API_KEY") if do_set_secrets else None
 
     if do_set_secrets and (not veracode_api_id or not veracode_api_key):
-        print("ERROR: --set-secrets requires VERACODE_API_ID and VERACODE_API_KEY env vars (admin credentials for API calls).", file=sys.stderr)
-        print("  Windows:   set VERACODE_API_ID=...  /  set VERACODE_API_KEY=...", file=sys.stderr)
-        print("  Linux/Mac: export VERACODE_API_ID=...  /  export VERACODE_API_KEY=...", file=sys.stderr)
+        print("ERROR: --set-secrets requires VERACODE_API_ID and VERACODE_API_KEY env vars.", file=sys.stderr)
         sys.exit(1)
 
     if do_set_secrets and (not veracode_sa_api_id or not veracode_sa_api_key):
-        print("ERROR: --set-secrets requires VERACODE_SA_API_ID and VERACODE_SA_API_KEY env vars (service account credentials to store in orgs).", file=sys.stderr)
-        print("  Windows:   set VERACODE_SA_API_ID=...  /  set VERACODE_SA_API_KEY=...", file=sys.stderr)
-        print("  Linux/Mac: export VERACODE_SA_API_ID=...  /  export VERACODE_SA_API_KEY=...", file=sys.stderr)
+        print("ERROR: --set-secrets requires VERACODE_SA_API_ID and VERACODE_SA_API_KEY env vars.", file=sys.stderr)
         sys.exit(1)
+
+    teams_map: Dict[str, str] = {}
+    if args.set_teams_file:
+        teams_map = load_teams_map(args.set_teams_file)
 
     print(f"\n{'=' * 60}")
     print(f"MODE: {'APPLY' if args.apply else 'DRY-RUN'}")
     print(f"{'=' * 60}")
     if args.apply:
-        print(f"  Import missing repos : {'YES' if do_apply_repo else 'NO (--import-repo)'}")
-        print(f"  Set teams in workflows: {'YES' if do_set_teams else 'NO (--set-teams-auto / --set-teams-file)'}")
-        print(f"  Install missing apps : {'YES' if do_apply_app else 'NO (--install-app)'}")
-        print(f"  Set Veracode secrets : {'YES' if do_set_secrets else 'NO (--set-secrets)'}")
+        print(f"  Import missing repos  : {'YES' if do_apply_repo else 'NO (--import-repo)'}")
+        if do_set_teams:
+            if args.set_teams_auto:
+                print(f"  Set teams in workflows: YES (auto - org name)")
+            else:
+                print(f"  Set teams in workflows: YES (from {args.set_teams_file})")
+        else:
+            print(f"  Set teams in workflows: NO (--set-teams-auto or --set-teams-file)")
+        print(f"  Install missing apps  : {'YES' if do_apply_app else 'NO (--install-app)'}")
+        print(f"  Set Veracode secrets  : {'YES' if do_set_secrets else 'NO (--set-secrets)'}")
         if do_apply_app:
             print(f"    Enterprise   : {enterprise or 'NOT SET (required for app install)'}")
             print(f"    App Client ID: {client_id or 'NOT SET (required for app install)'}")
         if do_set_secrets:
-            print(f"    VERACODE_API_ID     : {'SET' if veracode_api_id else 'NOT SET'}  (admin — for API calls)")
-            print(f"    VERACODE_API_KEY    : {'SET' if veracode_api_key else 'NOT SET'}  (admin — for API calls)")
-            print(f"    VERACODE_SA_API_ID  : {'SET' if veracode_sa_api_id else 'NOT SET'}  (service account — stored in orgs)")
-            print(f"    VERACODE_SA_API_KEY : {'SET' if veracode_sa_api_key else 'NOT SET'}  (service account — stored in orgs)")
+            print(f"    VERACODE_API_ID     : {'SET' if veracode_api_id else 'NOT SET'}  (admin - for API calls)")
+            print(f"    VERACODE_API_KEY    : {'SET' if veracode_api_key else 'NOT SET'}  (admin - for API calls)")
+            print(f"    VERACODE_SA_API_ID  : {'SET' if veracode_sa_api_id else 'NOT SET'}  (service account - stored in orgs)")
+            print(f"    VERACODE_SA_API_KEY : {'SET' if veracode_sa_api_key else 'NOT SET'}  (service account - stored in orgs)")
     else:
         print("  No changes will be made (use --apply to enable changes)")
     print(f"{'=' * 60}\n")
@@ -1237,18 +1173,23 @@ def main() -> None:
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    orgs = list_orgs(api_base, token, enterprise, args.orgs_file)
+    all_orgs = list_orgs(api_base, token, enterprise, args.orgs_file)
 
-    if args.dry_run:
-        orgs_file_path = outdir / "orgs.txt"
-        orgs_file_path.write_text("\n".join(orgs) + "\n", encoding="utf-8")
-        print(f"[dry-run] Wrote {len(orgs)} orgs to {orgs_file_path}")
-        generate_teams_map(orgs, outdir / "teams_map.csv")
+    if args.orgs_file and enterprise:
+        try:
+            with open(args.orgs_file, encoding="utf-8") as f:
+                filter_orgs = {line.strip() for line in f if line.strip() and not line.strip().startswith("#")}
+            filtered = [o for o in all_orgs if o in filter_orgs]
+            print(f"[OK] Filtered to {len(filtered)} orgs from {args.orgs_file}")
+            orgs = filtered
+        except Exception as exc:
+            print(f"[WARNING] Could not apply orgs-file filter: {exc}")
+            orgs = all_orgs
+    else:
+        orgs = all_orgs
 
-    teams_map: Dict[str, str] = {}
-    if args.set_teams_file and args.apply:
-        teams_map = load_teams_map(args.set_teams_file)
-        print(f"[teams-map] Loaded {len(teams_map)} org→teams mappings from {args.set_teams_file}\n")
+    write_orgs_txt(outdir / "orgs.txt", orgs)
+    write_teams_map_csv(outdir / "teams_map.csv", orgs)
 
     checkpoint_file = outdir / "checkpoint.json"
     start_index = 0
@@ -1290,19 +1231,22 @@ def main() -> None:
 
         entry: Dict[str, Any] = {"org": org}
 
-        teams_value: Optional[str] = teams_map.get(org) if args.set_teams_file else None
+        if do_set_teams:
+            if args.set_teams_auto:
+                teams_value: Optional[str] = org
+            else:
+                teams_value = teams_map.get(org, "").strip() or None
+        else:
+            teams_value = None
 
         try:
             repo_ok, repo_details = ensure_veracode_repo_imported(
                 api_base, org, token,
                 do_apply=do_apply_repo,
                 auto_import=do_apply_repo,
-                set_teams=do_set_teams,
                 teams_value=teams_value,
                 import_timeout_s=args.import_timeout,
                 import_poll_s=args.import_poll,
-                web_base=web_base,
-                git_timeout=args.git_timeout,
             )
             entry["veracode_repo"] = {"present": repo_ok, **repo_details}
             if not repo_ok:
@@ -1328,19 +1272,11 @@ def main() -> None:
             missing_app_rows.append([org, APP_SLUG, f"error:{exc}"])
             print(f"[{org}] App error: {str(exc)[:80]}")
 
-        if args.dry_run:
-            try:
-                secret_names = ["VERACODE_API_ID", "VERACODE_API_KEY", "VERACODE_AGENT_TOKEN"]
-                dry_results = {s: ("exists" if secret_exists(api_base, org, token, s) else "missing") for s in secret_names}
-                entry["secrets"] = {"status": "dry_run", "results": dry_results}
-            except Exception as exc:
-                entry["secrets"] = {"status": "error", "error": str(exc)}
-
         if do_set_secrets:
             try:
                 workspace_id = create_veracode_workspace(org, veracode_api_id, veracode_api_key)
                 if not workspace_id:
-                    entry["secrets"] = {"status": "error", "error": "Failed to create Veracode workspace"}
+                    entry["secrets"] = {"status": "error", "error": "Failed to create or find Veracode workspace"}
                 else:
                     agent_token = create_veracode_agent_token(workspace_id, org, veracode_api_id, veracode_api_key)
                     if not agent_token:
@@ -1356,8 +1292,11 @@ def main() -> None:
 
         write_report_entry(report_path, entry)
 
-        repo_status = "✓" if entry.get("veracode_repo", {}).get("present") else "✗"
-        app_status = "✓" if entry.get("workflow_app", {}).get("installed") else "✗"
+        repo_status = "+" if entry.get("veracode_repo", {}).get("present") else "x"
+        app_status = "+" if entry.get("workflow_app", {}).get("installed") else "x"
+        teams_detail = ""
+        if do_set_teams:
+            teams_detail = f" ({entry.get('veracode_repo', {}).get('teams_injection', 'n/a')})"
         secrets_status = ""
         if do_set_secrets:
             s = entry.get("secrets", {})
@@ -1366,25 +1305,14 @@ def main() -> None:
                 set_count = sum(1 for v in r.values() if v == "set")
                 exists_count = sum(1 for v in r.values() if v == "exists")
                 if exists_count == 3:
-                    secrets_status = "  Secrets: ✓ (all exist)"
+                    secrets_status = "  Secrets: + (all exist)"
                 elif set_count > 0:
-                    secrets_status = f"  Secrets: ✓ (set {set_count}, existed {exists_count})"
+                    secrets_status = f"  Secrets: + (set {set_count}, existed {exists_count})"
                 else:
-                    secrets_status = "  Secrets: ✓"
+                    secrets_status = "  Secrets: +"
             else:
-                secrets_status = "  Secrets: ✗"
-        elif args.dry_run:
-            s = entry.get("secrets", {})
-            if s.get("status") == "dry_run":
-                results = s.get("results", {})
-                missing = [k for k, v in results.items() if v == "missing"]
-                if not missing:
-                    secrets_status = "  Secrets: ✓ (all exist)"
-                else:
-                    secrets_status = f"  Secrets: ✗ ({len(missing)} missing)"
-            elif s.get("status") == "error":
-                secrets_status = "  Secrets: ? (check error)"
-        print(f"[{org}] Repo: {repo_status}  App: {app_status}{secrets_status}")
+                secrets_status = "  Secrets: x"
+        print(f"[{org}] Repo: {repo_status}{teams_detail}  App: {app_status}{secrets_status}")
 
         abs_processed = start_index + org_idx
         if org_idx % 10 == 0:
@@ -1401,8 +1329,8 @@ def main() -> None:
     write_csv(outdir / "manual_install_links.csv", ["organization", "install_link", "reason"], manual_links_rows)
 
     print("\nOutputs written to:", outdir.resolve())
-    if args.dry_run:
-        print(" - orgs.txt")
+    print(" - orgs.txt")
+    print(" - teams_map.csv")
     print(" - audit_report.json")
     print(" - missing_veracode_repo.csv")
     print(" - missing_workflow_app.csv")
