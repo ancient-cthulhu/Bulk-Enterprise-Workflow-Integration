@@ -1100,9 +1100,8 @@ def main() -> None:
                     help="[apply] Inject teams parameter using the org name as the team value.")
     ap.add_argument("--set-teams-file", metavar="FILE",
                     help=(
-                        "Teams map CSV workflow. "
-                        "Dry-run (no FILE needed): discovers orgs and writes out/teams_map.csv with a blank teams column. "
-                        "Apply (FILE required): reads the CSV and injects per-org team values. "
+                        "[apply] Read a teams_map.csv and inject per-org team values into workflow files. "
+                        "teams_map.csv is automatically generated on every dry-run. "
                         "Teams column accepts comma-separated team names."
                     ))
 
@@ -1139,7 +1138,7 @@ def main() -> None:
 
     if args.apply and args.set_secrets:
         try:
-            import nacl  # noqa: F401
+            import nacl  
         except ImportError:
             print("ERROR: --set-secrets requires pynacl.  Install with: pip install pynacl", file=sys.stderr)
             sys.exit(1)
@@ -1201,9 +1200,11 @@ def main() -> None:
 
     orgs = list_orgs(api_base, token, enterprise, args.orgs_file)
 
-    if args.set_teams_file is not None and args.dry_run:
+    if args.dry_run:
+        orgs_file_path = outdir / "orgs.txt"
+        orgs_file_path.write_text("\n".join(orgs) + "\n", encoding="utf-8")
+        print(f"[dry-run] Wrote {len(orgs)} orgs to {orgs_file_path}")
         generate_teams_map(orgs, outdir / "teams_map.csv")
-        sys.exit(0)
 
     teams_map: Dict[str, str] = {}
     if args.set_teams_file and args.apply:
@@ -1341,6 +1342,8 @@ def main() -> None:
     write_csv(outdir / "manual_install_links.csv", ["organization", "install_link", "reason"], manual_links_rows)
 
     print("\nOutputs written to:", outdir.resolve())
+    if args.dry_run:
+        print(" - orgs.txt")
     print(" - audit_report.json")
     print(" - missing_veracode_repo.csv")
     print(" - missing_workflow_app.csv")
