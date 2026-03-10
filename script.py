@@ -315,8 +315,23 @@ def create_veracode_workspace(org_name: str, api_id: str, api_key: str) -> Optio
         r = veracode_request("POST", "/srcclr/v3/workspaces", api_id, api_key, json={"name": org_name})
 
         if r.status_code in (200, 201):
-            if not r.content:
-                print("  [ERROR] Workspace created but response is empty")
+            # some API versions return 201 with empty body - re-fetch by name
+            if not r.content or not r.content.strip():
+                page = 1
+                while True:
+                    r2 = veracode_request("GET", f"/srcclr/v3/workspaces?page={page}&size=100", api_id, api_key)
+                    if r2.status_code != 200:
+                        print("  [ERROR] Workspace created but could not re-fetch ID")
+                        return None
+                    data2 = r2.json()
+                    for ws in data2.get("_embedded", {}).get("workspaces", []):
+                        if ws.get("name") == org_name:
+                            return ws.get("id")
+                    page_info = data2.get("page", {})
+                    if page >= page_info.get("totalPages", 1):
+                        break
+                    page += 1
+                print("  [ERROR] Workspace created but ID not found on re-fetch")
                 return None
             try:
                 ws_id = r.json().get("id")
@@ -583,6 +598,12 @@ def list_orgs_graphql(api_base: str, token: str, enterprise: str) -> Optional[Li
         return None
 
 
+def load_orgs_file(orgs_file: str) -> List[str]:
+    """Read org names from a file, skipping blank lines and # comments."""
+    with open(orgs_file, encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+
+
 def list_orgs(
     api_base: str,
     token: str,
@@ -592,28 +613,64 @@ def list_orgs(
     """Resolve the list of orgs to process.
 
     Discovery order:
-      1. Enterprise GraphQL API (when --enterprise is provided)
-      2. /user/orgs (all orgs the token belongs to)
-      3. Explicit --orgs-file
+      1. --orgs-file alone          - use file list directly
+      2. --enterprise alone         - discover all orgs via GraphQL
+      3. --enterprise + --orgs-file - discover via GraphQL, then filter to file list
+      4. Neither flag               - fall back to /user/orgs
     """
-    errors: List[str] = []
+    # orgs-file only - use it directly, no API discovery needed
+    if orgs_file and not enterprise:
+        try:
+            print(f"Reading orgs from file: {orgs_file}")
+            orgs = load_orgs_file(orgs_file)
+            if orgs:
+                print(f"[OK] Found {len(orgs)} orgs from file")
+                return orgs
+            raise RuntimeError(f"File '{orgs_file}' contains no valid org names")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"File read failed: {exc}")
 
     if enterprise:
         print(f'Discovering orgs via enterprise GraphQL: enterprise(slug: "{enterprise}")')
         try:
-            orgs = list_orgs_graphql(api_base, token, enterprise)
-            if orgs:
-                print(f"[OK] Found {len(orgs)} orgs via GraphQL")
-                return orgs
-            print(f"\n[ERROR] Enterprise GraphQL returned 0 organizations", file=sys.stderr)
-            for line in [
-                f"Enterprise slug '{enterprise}' may be wrong, or token lacks 'read:enterprise' scope.",
-                "Verify: gh auth status",
-                f"Check:  https://github.com/enterprises/{enterprise}",
-                "Retry without --enterprise to see accessible orgs: python script.py --dry-run",
-            ]:
-                print(f"  {line}", file=sys.stderr)
-            raise RuntimeError(f"Enterprise '{enterprise}' returned no organizations")
+            discovered = list_orgs_graphql(api_base, token, enterprise)
+            if not discovered:
+                print(f"\n[ERROR] Enterprise GraphQL returned 0 organizations", file=sys.stderr)
+                for line in [
+                    f"Enterprise slug '{enterprise}' may be wrong, or token lacks 'read:enterprise' scope.",
+                    "Verify: gh auth status",
+                    f"Check:  https://github.com/enterprises/{enterprise}",
+                    "Retry without --enterprise to see accessible orgs: python script.py --dry-run",
+                ]:
+                    print(f"  {line}", file=sys.stderr)
+                raise RuntimeError(f"Enterprise '{enterprise}' returned no organizations")
+
+            print(f"[OK] Found {len(discovered)} orgs via GraphQL")
+
+            # filter to orgs-file list if provided
+            if orgs_file:
+                try:
+                    file_orgs = load_orgs_file(orgs_file)
+                    if not file_orgs:
+                        raise RuntimeError(f"File '{orgs_file}' contains no valid org names")
+                    discovered_set = set(discovered)
+                    filtered = [o for o in file_orgs if o in discovered_set]
+                    skipped = [o for o in file_orgs if o not in discovered_set]
+                    if skipped:
+                        print(f"  [WARNING] {len(skipped)} org(s) in file not found in enterprise and will be skipped: {', '.join(skipped)}")
+                    if not filtered:
+                        raise RuntimeError("No orgs from --orgs-file were found in the enterprise org list")
+                    print(f"[OK] Filtered to {len(filtered)} orgs from {orgs_file}")
+                    return filtered
+                except RuntimeError:
+                    raise
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to apply --orgs-file filter: {exc}")
+
+            return discovered
+
         except RuntimeError:
             raise
         except requests.exceptions.RequestException as exc:
@@ -621,6 +678,7 @@ def list_orgs(
         except Exception as exc:
             raise RuntimeError(f"Enterprise API failed: {exc}")
 
+    # fallback: /user/orgs
     try:
         print("Discovering orgs via /user/orgs (all orgs the token user belongs to)")
         org_objs = paginate_list(f"{api_base}/user/orgs", token, params={"per_page": 100})
@@ -628,25 +686,10 @@ def list_orgs(
         if orgs:
             print(f"[OK] Found {len(orgs)} orgs via user API")
             return orgs
-        errors.append("User API returned no orgs")
     except Exception as exc:
-        errors.append(f"User API failed: {exc}")
+        pass
 
-    if orgs_file:
-        try:
-            print(f"Reading orgs from file: {orgs_file}")
-            with open(orgs_file, encoding="utf-8") as f:
-                orgs = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-            if orgs:
-                print(f"[OK] Found {len(orgs)} orgs from file")
-                return orgs
-            errors.append(f"File '{orgs_file}' contains no valid org names")
-        except Exception as exc:
-            errors.append(f"File read failed: {exc}")
-
-    print("\n[ERROR] Unable to determine org list. Tried:", file=sys.stderr)
-    for i, error in enumerate(errors, 1):
-        print(f"   {i}. {error}", file=sys.stderr)
+    print("\n[ERROR] Unable to determine org list.", file=sys.stderr)
     print("\nTroubleshooting:", file=sys.stderr)
     print("  • Ensure GITHUB_TOKEN is set with a valid token", file=sys.stderr)
     print("  • Verify token has 'read:org' scope", file=sys.stderr)
