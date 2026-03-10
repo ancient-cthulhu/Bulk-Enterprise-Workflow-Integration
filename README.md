@@ -53,6 +53,7 @@ This will:
 - Write `out/orgs.txt` - one org per line, ready to pass to `--orgs-file` or trim down for a targeted apply
 - Write `out/missing_veracode_repo.csv`, `out/missing_workflow_app.csv`, `out/manual_install_links.csv`
 - Write `out/teams_map.csv` - one row per org with a blank `teams` column, ready to fill in
+- If `--set-secrets` is also passed, checks and reports which orgs already have secrets configured
 
 
 #### Preparing for apply
@@ -64,7 +65,7 @@ After the dry-run, fill in `out/teams_map.csv` before running apply with `--set-
 "acme-dev","security,devops"
 "acme-staging","platform"
 "acme-prod","security"
-"acme-archive",""          ← leave blank to skip this org
+"acme-archive",""          <- leave blank to skip this org
 ```
 
 The `teams` column maps to Veracode Platform teams that receive scan results. Accepts a single name or a comma-separated list.
@@ -259,6 +260,7 @@ The `teams` parameter is injected into both workflow files:
 | `--api-base URL` | GitHub API base URL (GHES: `https://github.company.com/api/v3`) |
 | `--web-base URL` | GitHub web base URL (GHES: `https://github.company.com`) |
 | `--out DIR` | Output directory (default: `./out`) |
+| `--git-timeout SEC` | Timeout in seconds for each git clone/push operation (default: 300) |
 | `--skip-to ORG` | Skip all orgs before this one |
 | `--continue` | Resume from last checkpoint (`out/checkpoint.json`) |
 
@@ -386,17 +388,17 @@ MODE: APPLY
     VERACODE_SA_API_KEY : SET  (service account - stored in orgs)
 ============================================================
 
-[teams-map] Loaded 15 org→teams mappings from out/teams_map.csv
+[teams-map] Loaded 15 org->teams mappings from out/teams_map.csv
 [OK] Found 15 orgs via GraphQL
 
 [1/15 (6.7%)] Processing: acme-dev
-[acme-dev] Repo: ✓  App: ✓  Secrets: ✓ (set 3)
+[acme-dev] Repo: +  App: +  Secrets: + (set 3)
 
 [2/15 (13.3%)] Processing: acme-staging
-[acme-staging] Repo: ✓ (teams_added_to_2_files)  App: ✗  Secrets: ✓ (all exist)
+[acme-staging] Repo: + (teams_added_to_2_files)  App: x  Secrets: + (all exist)
 ```
 
-**Status indicators:** `✓` success / `✗` missing or failed / `(teams_added_to_2_files)` injected / `(teams_already_present)` skipped / `(set 3)` new secrets / `(all exist)` no changes needed
+**Status indicators:** `+` success / `x` missing or failed / `(teams_added_to_2_files)` injected / `(teams_already_present)` skipped / `(set 3)` new secrets / `(all exist)` no changes needed
 
 ---
 
