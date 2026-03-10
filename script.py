@@ -193,17 +193,22 @@ def write_csv(path: Path, header: List[str], rows: List[List[str]]) -> None:
 
 def write_report_entry(report_path: Path, entry: Dict[str, Any]) -> None:
     if not report_path.exists():
-        report_path.write_text("[\n" + json.dumps(entry, indent=2) + "\n]\n", encoding="utf-8")
+        report_path.write_text(
+            "[\n" + json.dumps(entry, indent=2) + "\n]\n",
+            encoding="utf-8",
+            newline="\n",
+        )
         return
-    with report_path.open("r+b") as f:
-        f.seek(0, 2)
-        size = f.tell()
-        if size >= 2:
-            f.seek(size - 2)
-            if f.read(2) == b"]\n":
-                f.seek(size - 2)
-                f.truncate()
-                f.write((",\n" + json.dumps(entry, indent=2) + "\n]\n").encode("utf-8"))
+    try:
+        existing = json.loads(report_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        existing = []
+    existing.append(entry)
+    report_path.write_text(
+        json.dumps(existing, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1048,7 +1053,7 @@ def write_teams_map_csv(path: Path, orgs: List[str]) -> None:
 
 
 def write_orgs_txt(path: Path, orgs: List[str]) -> None:
-    with path.open("w", encoding="utf-8") as f:
+    with path.open("w", encoding="utf-8", newline="\n") as f:
         for org in orgs:
             f.write(org + "\n")
 
@@ -1073,6 +1078,8 @@ def main() -> None:
                              help="[apply] Inject teams parameter using the org name.")
     teams_group.add_argument("--set-teams-file", metavar="FILE",
                              help="[apply] CSV file (org,teams) for per-org team injection.")
+    teams_group.add_argument("--set-teams-hybrid", metavar="FILE",
+                             help="[apply] CSV file (org,teams); orgs with blank teams fall back to org name.")
 
     ap.add_argument("--install-app", action="store_true",
                     help="[apply] Attempt enterprise installation of the Veracode Workflow App.")
@@ -1125,7 +1132,7 @@ def main() -> None:
     do_apply_repo = bool(args.apply and args.import_repo)
     do_apply_app = bool(args.apply and args.install_app)
     do_set_secrets = bool(args.apply and args.set_secrets)
-    do_set_teams = bool(args.apply and (args.set_teams_auto or args.set_teams_file))
+    do_set_teams = bool(args.apply and (args.set_teams_auto or args.set_teams_file or args.set_teams_hybrid))
 
     veracode_api_id = env("VERACODE_API_ID") if do_set_secrets else None
     veracode_api_key = env("VERACODE_API_KEY") if do_set_secrets else None
@@ -1143,6 +1150,8 @@ def main() -> None:
     teams_map: Dict[str, str] = {}
     if args.set_teams_file:
         teams_map = load_teams_map(args.set_teams_file)
+    elif args.set_teams_hybrid:
+        teams_map = load_teams_map(args.set_teams_hybrid)
 
     print(f"\n{'=' * 60}")
     print(f"MODE: {'APPLY' if args.apply else 'DRY-RUN'}")
@@ -1152,10 +1161,12 @@ def main() -> None:
         if do_set_teams:
             if args.set_teams_auto:
                 print(f"  Set teams in workflows: YES (auto - org name)")
+            elif args.set_teams_hybrid:
+                print(f"  Set teams in workflows: YES (hybrid - from {args.set_teams_hybrid}, org name fallback)")
             else:
                 print(f"  Set teams in workflows: YES (from {args.set_teams_file})")
         else:
-            print(f"  Set teams in workflows: NO (--set-teams-auto or --set-teams-file)")
+            print(f"  Set teams in workflows: NO (--set-teams-auto or --set-teams-file or --set-teams-hybrid)")
         print(f"  Install missing apps  : {'YES' if do_apply_app else 'NO (--install-app)'}")
         print(f"  Set Veracode secrets  : {'YES' if do_set_secrets else 'NO (--set-secrets)'}")
         if do_apply_app:
@@ -1240,6 +1251,8 @@ def main() -> None:
         if do_set_teams:
             if args.set_teams_auto:
                 teams_value: Optional[str] = org
+            elif args.set_teams_hybrid:
+                teams_value = teams_map.get(org, "").strip() or org
             else:
                 teams_value = teams_map.get(org, "").strip() or None
         else:
@@ -1330,6 +1343,7 @@ def main() -> None:
                 checkpoint_file.write_text(
                     json.dumps({"last_org": org, "processed": abs_processed}, indent=2),
                     encoding="utf-8",
+                    newline="\n",
                 )
             except Exception as exc:
                 print(f"  [WARNING] Failed to save checkpoint: {exc}")
