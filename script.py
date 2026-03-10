@@ -235,6 +235,7 @@ def git_mirror_import(
     target_org: str,
     target_repo: str,
     token: str,
+    web_base: str = "https://github.com",
 ) -> Tuple[bool, str]:
     """Bare-clone source_url and mirror-push to the target GitHub repo."""
     temp_dir: Optional[str] = None
@@ -250,7 +251,8 @@ def git_mirror_import(
         if clone_result.returncode != 0:
             return False, f"Clone failed: {clone_result.stderr}"
 
-        target_url = f"https://{token}@github.com/{target_org}/{target_repo}.git"
+        host = web_base.rstrip("/").replace("https://", "").replace("http://", "")
+        target_url = f"https://{token}@{host}/{target_org}/{target_repo}.git"
 
         push_result = subprocess.run(
             ["git", "-C", bare_repo, "push", "--mirror", target_url],
@@ -863,6 +865,7 @@ def ensure_veracode_repo_imported(
     teams_value: Optional[str] = None,
     import_timeout_s: int = 900,
     import_poll_s: int = 5,
+    web_base: str = "https://github.com",
 ) -> Tuple[bool, Dict[str, Any]]:
     """Ensure the Veracode integration repo exists and is populated.
 
@@ -898,7 +901,7 @@ def ensure_veracode_repo_imported(
             print(f"  [{org}] Git CLI not available — skipping auto import")
             auto_import = False
         else:
-            ok, message = git_mirror_import(INTEGRATION_SOURCE_URL, org, INTEGRATION_REPO_NAME, token)
+            ok, message = git_mirror_import(INTEGRATION_SOURCE_URL, org, INTEGRATION_REPO_NAME, token, web_base=web_base)
             if ok:
                 time.sleep(2)
                 if check_main_branch_exists(api_base, org, INTEGRATION_REPO_NAME, token):
@@ -925,7 +928,7 @@ def ensure_veracode_repo_imported(
 
     details["status"] = "repo_created_manual_import_required"
     details["import_instructions"] = {
-        "web_importer_url": f"https://github.com/{org}/{INTEGRATION_REPO_NAME}/import",
+        "web_importer_url": f"{web_base.rstrip('/')}/{org}/{INTEGRATION_REPO_NAME}/import",
         "source_url": INTEGRATION_SOURCE_URL,
         "note": "Manual import required — use GitHub web UI",
     }
@@ -1258,6 +1261,7 @@ def main() -> None:
                 teams_value=teams_value,
                 import_timeout_s=args.import_timeout,
                 import_poll_s=args.import_poll,
+                web_base=web_base,
             )
             entry["veracode_repo"] = {"present": repo_ok, **repo_details}
             if not repo_ok:
