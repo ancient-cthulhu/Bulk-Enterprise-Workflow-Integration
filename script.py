@@ -209,12 +209,17 @@ def write_report_entry(report_path: Path, entry: Dict[str, Any]) -> None:
     with report_path.open("r+b") as f:
         f.seek(0, 2)
         size = f.tell()
-        if size >= 2:
-            f.seek(size - 2)
-            if f.read(2) == b"]\n":
-                f.seek(size - 2)
-                f.truncate()
-                f.write((",\n" + json.dumps(entry, indent=2) + "\n]\n").encode("utf-8"))
+        # Read last 4 bytes to handle both LF (\n) and CRLF (\r\n) line endings
+        tail_size = min(size, 4)
+        f.seek(size - tail_size)
+        tail = f.read(tail_size)
+        # Strip trailing whitespace/newlines to find the closing bracket position
+        stripped = tail.rstrip(b"\r\n ")
+        if stripped.endswith(b"]"):
+            cut_pos = size - tail_size + len(stripped) - 1
+            f.seek(cut_pos)
+            f.truncate()
+            f.write((",\n" + json.dumps(entry, indent=2) + "\n]\n").encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
