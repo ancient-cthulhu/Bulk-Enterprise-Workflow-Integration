@@ -9,7 +9,7 @@ Automates Veracode security scanning deployment across GitHub Enterprise organiz
 **Key capabilities:**
 - Enterprise organization discovery
 - Automatic repository import via git CLI
-- Team parameter injection into workflow files (auto or per-org from CSV)
+- Team parameter injection into workflow files (auto, per-org from CSV, or hybrid)
 - Veracode workspace and GitHub Actions secrets automation
 - Idempotent operations (safe to re-run)
 - Comprehensive JSON audit reports
@@ -22,7 +22,7 @@ For each GitHub organization:
 1. Check/Create the `veracode` integration repository
 2. Auto-import repository content from Veracode's template (via git CLI)
 3. Inject customized `veracode.yml` with onboarding settings
-4. Update workflow files with team name (via `--set-teams-auto` or `--set-teams-file`)
+4. Update workflow files with team name (via `--set-teams-auto`, `--set-teams-file`, or `--set-teams-hybrid`)
 5. Check/Install the `veracode-workflow-app` GitHub App
 6. Create Veracode workspace, generate agent token, and set GitHub Actions secrets
 
@@ -58,14 +58,14 @@ This will:
 
 #### Preparing for apply
 
-After the dry-run, fill in `out/teams_map.csv` before running apply with `--set-teams-file`:
+After the dry-run, fill in `out/teams_map.csv` before running apply with `--set-teams-file` or `--set-teams-hybrid`:
 
 ```
 "org","teams"
 "acme-dev","security,devops"
 "acme-staging","platform"
 "acme-prod","security"
-"acme-archive",""          <- leave blank to skip this org
+"acme-archive",""          <- leave blank to skip (--set-teams-file) or use org name (--set-teams-hybrid)
 ```
 
 The `teams` column maps to Veracode Platform teams that receive scan results. Accepts a single name or a comma-separated list.
@@ -109,6 +109,16 @@ If all orgs should use their org name as the team value:
 python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-teams-auto --install-app --app-client-id YOUR_APP_CLIENT_ID --set-secrets
 ```
 
+#### Hybrid teams - CSV with org name fallback
+
+If most orgs have specific team values but some should fall back to their org name:
+
+```bash
+python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-teams-hybrid out/teams_map.csv --install-app --app-client-id YOUR_APP_CLIENT_ID --set-secrets
+```
+
+Orgs with a value in the CSV get that value. Orgs with a blank `teams` column get their org name injected automatically.
+
 #### Teams injection only - repos already exist
 
 ```bash
@@ -117,9 +127,12 @@ python script.py --apply --enterprise YOUR-ENTERPRISE --set-teams-file out/teams
 
 # Org name as team for all orgs:
 python script.py --apply --enterprise YOUR-ENTERPRISE --set-teams-auto
+
+# CSV with org name fallback for blank rows:
+python script.py --apply --enterprise YOUR-ENTERPRISE --set-teams-hybrid out/teams_map.csv
 ```
 
-Both are idempotent - workflow files that already have a `teams:` parameter are skipped.
+All three modes are idempotent - workflow files that already have a `teams:` parameter are skipped.
 
 ---
 
@@ -202,7 +215,9 @@ repo, workflow, admin:org, admin:enterprise, read:enterprise
 
 **`--set-teams-file FILE`** - injects per-org team values from a CSV. `teams_map.csv` is generated automatically on every dry-run - fill it in and pass it back with `--apply --set-teams-file`. Comma-separated team names are supported. Blank rows are skipped.
 
-Both modes are idempotent - files that already have `teams:` are left unchanged.
+**`--set-teams-hybrid FILE`** - same as `--set-teams-file` but orgs with a blank `teams` column fall back to their org name instead of being skipped. Useful when most orgs have specific team assignments but the rest should still get a team injected.
+
+All three modes are idempotent - files that already have `teams:` are left unchanged.
 
 ### Secrets Management
 
@@ -248,7 +263,8 @@ The `teams` parameter is injected into both workflow files:
 |------|-------------|
 | `--import-repo` | Create and populate the `veracode` repository |
 | `--set-teams-auto` | Inject `teams` parameter using the org name |
-| `--set-teams-file FILE` | Read `teams_map.csv` and inject per-org team values into workflow files. `teams_map.csv` is generated automatically on every dry-run. Teams column accepts comma-separated names. |
+| `--set-teams-file FILE` | Read `teams_map.csv` and inject per-org team values into workflow files. `teams_map.csv` is generated automatically on every dry-run. Teams column accepts comma-separated names. Blank rows are skipped. |
+| `--set-teams-hybrid FILE` | Same as `--set-teams-file` but orgs with a blank `teams` column fall back to the org name instead of being skipped. |
 | `--install-app` | Install `veracode-workflow-app` (enterprise API, falls back to manual) |
 | `--set-secrets` | Set `VERACODE_API_ID`, `VERACODE_API_KEY`, `VERACODE_AGENT_TOKEN` in each org |
 
@@ -282,7 +298,7 @@ The `teams` parameter is injected into both workflow files:
 |------|-------------|
 | `orgs.txt` | Generated on every dry-run - one org per line, ready to pass to `--orgs-file` or trim for a targeted apply |
 | `audit_report.json` | Per-org execution report, written incrementally (crash-safe) |
-| `teams_map.csv` | Generated on every dry-run - fill in the `teams` column and pass back with `--apply --set-teams-file` |
+| `teams_map.csv` | Generated on every dry-run - fill in the `teams` column and pass back with `--apply --set-teams-file` or `--set-teams-hybrid` |
 | `missing_veracode_repo.csv` | Orgs missing the veracode repository |
 | `missing_workflow_app.csv` | Orgs missing the workflow app |
 | `manual_install_links.csv` | Clickable app install links |
@@ -414,7 +430,7 @@ MODE: APPLY
 
 ## Support
 
-Supported: GitHub.com · GitHub Enterprise Cloud (GHEC) · GitHub Enterprise Server (GHES) 
+Supported: GitHub.com · GitHub Enterprise Cloud (GHEC) · GitHub Enterprise Server (GHES)
 
 For issues provide `out/audit_report.json`, platform type, and command used.
 
