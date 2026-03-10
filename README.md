@@ -7,15 +7,14 @@ Automated script to deploy Veracode GitHub Workflow integration across multiple 
 Automates Veracode security scanning deployment across GitHub Enterprise organizations. Handles repository creation, workflow configuration, team assignments, app installation, and secrets management with detailed audit trails.
 
 **Key capabilities:**
-- GraphQL-based enterprise organization discovery
+- Enterprise organization discovery
 - Automatic repository import via git CLI
-- Team parameter injection into workflow files
+- Team parameter injection into workflow files (auto or per-org from CSV)
 - Veracode workspace and GitHub Actions secrets automation
 - Idempotent operations (safe to re-run)
 - Comprehensive JSON audit reports
 - Automatic rate limit handling with retry logic
 - Checkpoint/resume for large deployments (100+ orgs)
-- Progress tracking with execution summaries
 
 ## What It Does
 
@@ -23,194 +22,209 @@ For each GitHub organization:
 1. Check/Create the `veracode` integration repository
 2. Auto-import repository content from Veracode's template (via git CLI)
 3. Inject customized `veracode.yml` with onboarding settings
-4. Update workflow files with organization team name (via `--set-teams`)
+4. Update workflow files with team name (via `--set-teams-auto` or `--set-teams-file`)
 5. Check/Install the `veracode-workflow-app` GitHub App
-6. Set up secrets - Creates Veracode workspace, generates agent tokens, and configures GitHub Actions secrets
+6. Create Veracode workspace, generate agent token, and set GitHub Actions secrets
 
 ## Modes
 
-- **DRY-RUN** (default): Read-only audit - reports status without changes
-- **APPLY**: Makes changes when explicitly enabled with action flags
+- **DRY-RUN** (default): Read-only - reports status and generates helper files, no changes made
+- **APPLY**: Makes changes when explicitly enabled with `--apply` and action flags
+
+---
+
+## Dry-Run & Apply Walkthrough
+
+### Phase 1 - Dry-Run (No Changes Made)
+
+Discovers your organizations, checks current state, and generates output files to plan your rollout.
+
+#### Full audit + generate teams map
+
+```bash
+export GITHUB_TOKEN="your_github_token"
+
+python script.py --enterprise YOUR-ENTERPRISE --set-teams-file
+```
+
+This will:
+- Discover all orgs via GraphQL
+- Check each org for the `veracode` repo and `veracode-workflow-app`
+- Write `out/missing_veracode_repo.csv`, `out/missing_workflow_app.csv`, `out/manual_install_links.csv`
+- Write `out/teams_map.csv` with one row per org and a blank `teams` column
+
+If you don't need the teams map yet, a plain dry-run is enough:
+
+```bash
+python script.py --enterprise YOUR-ENTERPRISE
+```
+
+#### Preparing for apply
+
+After the dry-run, fill in `out/teams_map.csv` before running apply with `--set-teams-file`:
+
+```
+"org","teams"
+"acme-dev","security,devops"
+"acme-staging","platform"
+"acme-prod","security"
+"acme-archive",""          ← leave blank to skip this org
+```
+
+The `teams` column maps to Veracode Platform teams that receive scan results. Accepts a single name or a comma-separated list.
+
+---
+
+### Phase 2 - Apply (Makes Changes)
+
+Each flag is independent - run all together or only what you need.
+
+#### Full rollout
+
+```bash
+export GITHUB_TOKEN="your_github_token"
+export VERACODE_API_ID="admin_api_id"
+export VERACODE_API_KEY="admin_api_key"
+export VERACODE_SA_API_ID="service_account_api_id"
+export VERACODE_SA_API_KEY="service_account_api_key"
+
+python script.py --apply \
+  --enterprise YOUR-ENTERPRISE \
+  --import-repo \
+  --set-teams-file out/teams_map.csv \
+  --install-app \
+  --app-client-id YOUR_APP_CLIENT_ID \
+  --set-secrets
+```
+
+Per org this will:
+1. Create the `veracode` repo if missing and mirror-import from the Veracode template
+2. Inject the customized `veracode.yml` onboarding configuration
+3. Inject `teams: "..."` into policy and sandbox scan workflow files from `teams_map.csv` (blank rows skipped)
+4. Install `veracode-workflow-app` via enterprise API, or fall back to manual install link
+5. Create a Veracode workspace, generate a unique agent token, and set `VERACODE_API_ID`, `VERACODE_API_KEY`, and `VERACODE_AGENT_TOKEN` as org-level Actions secrets
+
+#### Auto teams - no CSV needed
+
+If all orgs should use their org name as the team value:
+
+```bash
+python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-teams-auto --install-app --app-client-id YOUR_APP_CLIENT_ID --set-secrets
+```
+
+#### Teams injection only - repos already exist
+
+```bash
+# Per-org teams from CSV:
+python script.py --apply --enterprise YOUR-ENTERPRISE --set-teams-file out/teams_map.csv
+
+# Org name as team for all orgs:
+python script.py --apply --enterprise YOUR-ENTERPRISE --set-teams-auto
+```
+
+Both are idempotent - workflow files that already have a `teams:` parameter are skipped.
+
+---
 
 ## Requirements
 
 ```bash
-# Core dependencies
 pip install requests
-
-# For secrets management
-pip install pynacl
-
-# For auto-import (optional)
-git --version  # Must be available in PATH
+pip install pynacl       # required for --set-secrets
+git --version            # required for --import-repo
 ```
 
 **Python 3.8+** required
 
-## Quick Start
+---
 
-### 1. Audit Only (Safe - No Changes)
-```bash
-# Set GitHub token
-export GITHUB_TOKEN="your_github_token"
+## Credentials
 
-python script.py --enterprise YOUR-ENTERPRISE
-```
+Two separate credential pairs are required when using `--set-secrets`:
 
-### 2. Create Repos + Auto-Import + Inject Teams
-```bash
-python script.py --apply --import-repo --set-teams --enterprise YOUR-ENTERPRISE
-```
+| Variable | Purpose |
+|----------|---------|
+| `VERACODE_API_ID` | Admin credentials - used by the script to call the Veracode API (create workspaces, generate agent tokens) |
+| `VERACODE_API_KEY` | Admin credentials |
+| `VERACODE_SA_API_ID` | Service account credentials - stored as `VERACODE_API_ID` in each org's GitHub Actions secrets |
+| `VERACODE_SA_API_KEY` | Service account credentials - stored as `VERACODE_API_KEY` in each org's GitHub Actions secrets |
 
-### 3. Full Automation (Repos + Teams + App + Secrets)
+The admin credentials are never stored anywhere. The service account credentials are what gets deployed to org secrets and used by workflows at scan time.
 
-**Linux/Mac:**
-```bash
-export GITHUB_TOKEN="your_github_token"
-export VERACODE_API_ID="your_veracode_api_id"
-export VERACODE_API_KEY="your_veracode_api_key"
-
-python script.py --apply --import-repo --set-teams --install-app --set-secrets \
-  --enterprise YOUR-ENTERPRISE \
-  --app-client-id YOUR_APP_CLIENT_ID
-```
-
-**Windows (PowerShell):**
-```powershell
-$env:GITHUB_TOKEN="your_github_token"
-$env:VERACODE_API_ID="your_veracode_api_id"
-$env:VERACODE_API_KEY="your_veracode_api_key"
-
-python script.py --apply --import-repo --set-teams --install-app --set-secrets --enterprise YOUR-ENTERPRISE --app-client-id YOUR_APP_CLIENT_ID
-```
-
-**Windows (CMD):**
-```cmd
-set GITHUB_TOKEN=your_github_token
-set VERACODE_API_ID=your_veracode_api_id
-set VERACODE_API_KEY=your_veracode_api_key
-
-python script.py --apply --import-repo --set-teams --install-app --set-secrets --enterprise YOUR-ENTERPRISE --app-client-id YOUR_APP_CLIENT_ID
-```
+---
 
 ## GitHub Token Permissions
 
-### Minimum (Audit Mode)
-```
-read:org    # List organizations and check app installations
-repo        # Access private repositories
-```
-
-### For Apply Mode with Repo Import (--import-repo)
+### Minimum (Dry-Run)
 ```
 read:org
 repo
-workflow    # REQUIRED - Push workflow files to repositories
-```
-**Critical:** The `workflow` scope is required when using `--import-repo` because the Veracode template includes workflow files. Without this scope, git push operations will be rejected.
-
-### For Enterprise Organization Discovery (--enterprise flag)
-```
-read:org
-repo
-workflow    # Required if also using --import-repo
-read:enterprise  # OR admin:enterprise - Required to list orgs in enterprise
-```
-**Important:** When using `--enterprise` to discover organizations, your token MUST have `read:enterprise` or `admin:enterprise` scope. If these scopes don't appear in your token (check via API), the enterprise REST API will return 404. GraphQL will still work as a fallback.
-
-### For Apply Mode with Secrets
-```
-read:org
-repo
-workflow    # Required if also using --import-repo
-admin:org   # Set organization-level secrets
 ```
 
-### For Enterprise App Installation (--install-app)
+### With --import-repo
 ```
-admin:enterprise  # Enterprise-wide app installation and org discovery
-admin:org         # Organization management
-repo              # Repository access
-workflow          # Required if also using --import-repo
+read:org, repo, workflow    # workflow required to push workflow files
 ```
 
-### Complete Token Scopes (All Features)
+### With --enterprise
 ```
-repo              # Full repository access
-workflow          # Push workflow files
-admin:org         # Manage organization secrets
-admin:enterprise  # Enterprise management and org discovery
-read:enterprise   # Read enterprise data (if available)
+read:org, repo, read:enterprise (or admin:enterprise)
 ```
 
-### Token Security
+### With --set-secrets
+```
+read:org, repo, admin:org
+```
 
-The `GITHUB_TOKEN` is passed directly in the git remote URL for repository import operations (`https://{token}@github.com/...`). Store it as an environment variable — never hardcode it in the script or commit it to source control. In CI environments, use a GitHub Actions secret or equivalent secrets manager.
+### With --install-app
+```
+admin:enterprise, admin:org, repo, workflow
+```
+
+### All features
+```
+repo, workflow, admin:org, admin:enterprise, read:enterprise
+```
+
+**Token security:** `GITHUB_TOKEN` is passed in the git remote URL for import operations. Store it as an environment variable or use a GitHub Actions secret in CI.
+
+---
 
 ## Features
 
 ### Repository Management
 - Creates `veracode` repo in each org if missing
-- Automatically imports content from `github.com/veracode/github-actions-integration`
-- Uses git CLI for fast, reliable mirroring
-- Falls back to manual instructions if git unavailable
-- **Automatically pushes customized `veracode.yml` configuration**
-- Adds the **teams** option to the *veracode-policy-scan.yml* and *veracode-sandbox-scan.yml* in *veracode/.github/workflows/*
+- Mirror-imports content from `github.com/veracode/github-actions-integration` via git CLI
+- Injects customized `veracode.yml` onboarding configuration
+- Falls back to manual import instructions if git is unavailable
 
-### App Installation
-- **Automated** (Enterprise only): Installs app via Enterprise API
-- **Manual**: Generates clickable install links in CSV
-- Pre-fills org information for one-click installation
+### Team Parameter Injection
 
-### Secrets Management (NEW)
-Automatically sets up three organization-level GitHub Actions secrets:
+**`--set-teams-auto`** - injects `teams: "<org-name>"` for every org. No configuration needed.
 
-1. **VERACODE_API_ID** - Your Veracode API credentials
-2. **VERACODE_API_KEY** - Your Veracode API credentials  
-3. **VERACODE_AGENT_TOKEN** - Unique per-org agent token (auto-generated)
+**`--set-teams-file FILE`** - injects per-org team values from a CSV. Run without `--apply` to generate the template, fill it in, re-run with `--apply`. Comma-separated team names are supported. Blank rows are skipped.
 
-**How it works:**
-- Creates a Veracode workspace per org (or uses existing)
-- Generates a unique agent token for each workspace
-- Encrypts and sets secrets via GitHub API
-- Secrets are available to all workflows in the org
+Both modes are idempotent - files that already have `teams:` are left unchanged.
 
-**Setup:**
-```bash
-# Set credentials
-export VERACODE_API_ID="your_veracode_api_id"
-export VERACODE_API_KEY="your_veracode_api_key"
+### Secrets Management
 
-# Run with --set-secrets
-python script.py --apply --set-secrets
-```
+Sets three org-level GitHub Actions secrets per org:
+- `VERACODE_API_ID` - from `VERACODE_SA_API_ID` (service account)
+- `VERACODE_API_KEY` - from `VERACODE_SA_API_KEY` (service account)
+- `VERACODE_AGENT_TOKEN` - unique per-org, auto-generated from the org's Veracode workspace
 
 ---
 
 ## Veracode Repository Configuration
 
-When the script imports the `veracode` repository, it automatically injects a customized `veracode.yml` configuration file optimized for onboarding.
+The injected `veracode.yml` is pre-configured for onboarding:
 
-### Configuration Changes Applied
-
-The injected `veracode.yml` includes the following onboarding-friendly settings:
-
-#### 1. Platform Reporting Enabled
 ```yaml
 analysis_on_platform: true
-```
-Ensures all scan results are sent to the Veracode Platform for centralized visibility.
-
-#### 2. Break-Build Settings Disabled (Onboarding Mode)
-```yaml
-break_build_policy_findings: false
+break_build_policy_findings: false   # don't fail pipelines during onboarding
 break_build_invalid_policy: false
-break_build_on_error: true  # Only fails on scan errors, not policy violations
-```
-**Why:** Prevents pipelines from failing during initial testing and onboarding. Teams can verify scans work without disrupting development.
-
-#### 3. Unified Issue-Based Trigger
-```yaml
+break_build_on_error: true           # still fail on scan errors
+policy: 'Omnicom Base Policy'
 issues:
   trigger: true
   commands:
@@ -219,133 +233,65 @@ issues:
     - "Veracode IAC Scan"
     - "Veracode All Scans"
 ```
-**Usage:** Comment on any GitHub issue with `Veracode All Scans [branch: main]` to trigger all scan types with a single command.
 
-#### 4. Omnicom Base Policy Applied
-```yaml
-policy: 'Omnicom Base Policy'
-```
-Aligns all scans with the organization's baseline security policy.
+Once onboarding is complete, re-enable gating by setting `break_build_policy_findings: true` and `break_build_invalid_policy: true`.
 
-### Complete Configuration Template
-
-The injected `veracode.yml` includes configurations for three scan types:
-
-1. **Static Analysis (SAST)** - `veracode_static_scan`
-2. **Software Composition Analysis (SCA)** - `veracode_sca_scan`
-3. **Infrastructure as Code & Secrets** - `veracode_iac_secrets_scan`
-
-Each scan is configured to:
-- Trigger on push to any branch
-- Trigger on pull requests to default branch
-- Report to Veracode Platform
-- Allow manual triggering via GitHub Issues
-- **Not break builds** during onboarding
-
-### Post-Onboarding: Re-Enable Gating
-
-After testing and verification, teams can enable break-build behavior by editing their `veracode.yml`:
+The `teams` parameter is injected into both workflow files:
 
 ```yaml
-break_build_policy_findings: true
-break_build_invalid_policy: true
-break_build_on_error: true
-```
-
-### Repository List Control
-
-The imported repo also includes `repo-list.yml` to control which repositories are scanned:
-
-```yaml
-# Include all repos by default
-include_repos:
-  - '*'
-
-# Exclude specific repos if needed
-exclude_repos:
-  - 'veracode'
-  # - 'archived-project'
-```
-
-This allows organizations to selectively enable scanning as teams onboard.
-
-### Workflow File Updates
-
-The script also automatically updates the Veracode workflow files to include the organization name as the team parameter:
-
-**Files updated:**
-- `.github/workflows/veracode-sandbox-scan.yml`
-- `.github/workflows/veracode-policy-scan.yml`
-
-**Change applied:**
-```yaml
-# Added to the Veracode Upload and Scan Action step
-- name: Veracode Upload and Scan Action Step
-  uses: veracode/uploadandscan-action@v0.1.6
+- uses: veracode/uploadandscan-action@v0.1.6
   with:
-    appname: ${{ inputs.profile_name }}
-    # ... other parameters ...
-    failbuild: ${{ inputs.break_build_policy_findings }}
-    team: 'organization-name'  # <- Automatically added
+    teams: "org-name-or-custom-value"
 ```
-
-**Why this matters:**
-- Maps scan results to the correct Veracode workspace
-- Uses the same team name as the Veracode workspace created by `--set-secrets`
-- Ensures proper organization and reporting in the Veracode Platform
-
-**Team name = Organization name = Workspace name**
-
-This ensures all Veracode components (workspace, secrets, scan results) are properly linked to the GitHub organization.
 
 ---
 
 ## Command-Line Flags
 
-### Action Flags (Require `--apply`)
+### Action Flags (require `--apply`)
 | Flag | Description |
 |------|-------------|
-| `--import-repo` | Create and populate the veracode repository with template content |
-| `--set-teams` | Inject team parameter into workflow files (uses org name as team) |
-| `--install-app` | Attempt automated app installation (Enterprise API, may require manual) |
-| `--set-secrets` | Configure Veracode secrets automatically (VERACODE_API_ID, VERACODE_API_KEY, VERACODE_AGENT_TOKEN) |
-
-**Note:** `--set-teams` is typically used with `--import-repo` to inject the team parameter immediately after import.
+| `--import-repo` | Create and populate the `veracode` repository |
+| `--set-teams-auto` | Inject `teams` parameter using the org name |
+| `--set-teams-file FILE` | Dry-run: generate `out/teams_map.csv`. Apply: read FILE and inject per-org values |
+| `--install-app` | Install `veracode-workflow-app` (enterprise API, falls back to manual) |
+| `--set-secrets` | Set `VERACODE_API_ID`, `VERACODE_API_KEY`, `VERACODE_AGENT_TOKEN` in each org |
 
 ### Configuration
 | Flag | Description |
 |------|-------------|
-| `--enterprise SLUG` | GitHub Enterprise slug for org discovery (uses GraphQL API) |
+| `--enterprise SLUG` | GitHub Enterprise slug for org discovery |
 | `--app-client-id ID` | GitHub App client ID (required for `--install-app`) |
-| `--orgs-file FILE` | Text file with org names (one per line, alternative to --enterprise) |
-| `--api-base URL` | GitHub API base (for GHES: `https://github.company.com/api/v3`) |
-| `--web-base URL` | GitHub web base (for GHES: `https://github.company.com`) |
-| `--skip-to ORG` | Skip to this organization name and continue from there |
-| `--continue` | Resume from last checkpoint (out/checkpoint.json) |
+| `--orgs-file FILE` | Text file with one org name per line (alternative to `--enterprise`) |
+| `--api-base URL` | GitHub API base URL (GHES: `https://github.company.com/api/v3`) |
+| `--web-base URL` | GitHub web base URL (GHES: `https://github.company.com`) |
+| `--out DIR` | Output directory (default: `./out`) |
+| `--skip-to ORG` | Skip all orgs before this one |
+| `--continue` | Resume from last checkpoint (`out/checkpoint.json`) |
 
 ### Environment Variables
-| Variable | Description |
-|----------|-------------|
-| `GITHUB_TOKEN` | GitHub personal access token (required) |
-| `VERACODE_API_ID` | Veracode API ID (required for `--set-secrets`) |
-| `VERACODE_API_KEY` | Veracode API key (required for `--set-secrets`) |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GITHUB_TOKEN` | Always | GitHub personal access token |
+| `VERACODE_API_ID` | `--set-secrets` | Admin API credentials for Veracode API calls |
+| `VERACODE_API_KEY` | `--set-secrets` | Admin API credentials for Veracode API calls |
+| `VERACODE_SA_API_ID` | `--set-secrets` | Service account credentials stored in org secrets |
+| `VERACODE_SA_API_KEY` | `--set-secrets` | Service account credentials stored in org secrets |
+
+---
 
 ## Output Files
 
-All files created in `out/` directory:
-
 | File | Description |
 |------|-------------|
-| `audit_report.json` | Complete execution report with all details per org, written incrementally (crash-safe) |
+| `audit_report.json` | Per-org execution report, written incrementally (crash-safe) |
+| `teams_map.csv` | Generated by `--set-teams-file` in dry-run - fill in and pass back with `--apply` |
 | `missing_veracode_repo.csv` | Orgs missing the veracode repository |
 | `missing_workflow_app.csv` | Orgs missing the workflow app |
-| `manual_install_links.csv` | **Clickable install links** (open in Excel) |
+| `manual_install_links.csv` | Clickable app install links |
 
-### Audit Report Tracking
+### Audit Report Example
 
-The `audit_report.json` file provides detailed tracking of all changes made to each organization. Each org entry is written immediately after processing — a crash mid-run will not lose completed results.
-
-**Example entry:**
 ```json
 {
   "org": "acme-dev",
@@ -372,85 +318,60 @@ The `audit_report.json` file provides detailed tracking of all changes made to e
 }
 ```
 
-**Tracked fields:**
-
-**Repository:**
-- `status`: `repo_exists`, `repo_created_and_imported`, `missing`, `error`
-- `import_method`: `git_cli_auto`, `manual`
-- `teams_injection`: `teams_added_to_2_files`, `teams_already_present`, `error`
-
-**veracode.yml:**
-- `veracode_yml_injected`: `created`, `updated_with_backup`, `already_exists`, `template_not_found`, `failed`
-
-**Secrets:**
-- Per secret status: `set`, `exists`, `failed`
-
-**App:**
-- `status`: `already_installed`, `installed_after_attempt`, `missing`
-- `reason`: `auto_install_blocked`, `manual_install_required`
-
-This detailed tracking enables:
-- Auditing changes made to each organization
-- Identifying organizations requiring manual intervention
-- Safe re-runs without duplicating changes
-- Compliance reporting
-- Team parameter injection tracking
+---
 
 ## Organization Discovery
 
-The script discovers organizations using a GraphQL-first approach:
+1. **`--enterprise SLUG`** - GraphQL enterprise API, requires `read:enterprise` or `admin:enterprise`
+2. **No flag** - falls back to `/user/orgs` (all orgs your token can access)
+3. **`--orgs-file FILE`** - explicit list, one org per line, `#` for comments
 
-1. **Enterprise GraphQL API** (if `--enterprise` provided) - Primary method
-   - Requires `read:enterprise` or `admin:enterprise` scope
-   
-2. **User API** (fallback when no `--enterprise` flag)
-   - Lists all orgs your token has access to
-   - Not filtered by enterprise
-   - Requires `read:org` scope
-   
-3. **File** (if `--orgs-file` provided)
-   - Manual org list from text file
-   - One org name per line
-   - Comments start with `#`
+```
+# One org name per line
+# Lines starting with # are treated as comments
 
-### Common Issues
+acme-dev
+acme-staging
+acme-prod
+acme-archive
+```
+---
 
-**Enterprise API returns 0 organizations:**
-- Verify enterprise slug is correct: `https://github.com/enterprises/YOUR-ENTERPRISE`
-- Token must have `read:enterprise` or `admin:enterprise` scope
-- Confirm you have access to the enterprise
+## Platform Examples
 
-**Authentication errors:**
-- Verify token is set: `echo $GITHUB_TOKEN`
-- Check token scopes at: https://github.com/settings/tokens
-- Required scopes: `read:org`, `read:enterprise` (for --enterprise flag)
-
-**Repo import fails on Windows:**
-- Ensure `GITHUB_TOKEN` is set in your environment before running
-- The token is used directly in the git remote URL — Git Credential Manager must not override it
-- If GCM is intercepting, run: `git config --global credential.helper ""` to disable it temporarily
-
-## GitHub Enterprise Cloud (GHEC)
+### GitHub Enterprise Cloud (GHEC)
 
 ```bash
-export VERACODE_API_ID="your_api_id"
-export VERACODE_API_KEY="your_api_key"
+export GITHUB_TOKEN="..."
+export VERACODE_API_ID="..."  VERACODE_API_KEY="..."
+export VERACODE_SA_API_ID="..."  VERACODE_SA_API_KEY="..."
 
-python script.py --apply --import-repo --install-app --set-secrets \
+python script.py --apply --import-repo --set-teams-file out/teams_map.csv --install-app --set-secrets \
   --enterprise your-enterprise-slug \
   --app-client-id Iv1.xxxxx
 ```
 
-## GitHub Enterprise Server (GHES)
+### GitHub Enterprise Server (GHES)
 
 ```bash
-export VERACODE_API_ID="your_api_id"
-export VERACODE_API_KEY="your_api_key"
+export GITHUB_TOKEN="..."
+export VERACODE_API_ID="..."  VERACODE_API_KEY="..."
+export VERACODE_SA_API_ID="..."  VERACODE_SA_API_KEY="..."
 
-python script.py --apply --import-repo --set-secrets \
+python script.py --apply --import-repo --set-teams-file out/teams_map.csv --set-secrets \
+  --enterprise your-enterprise-slug \
   --api-base https://github.company.com/api/v3 \
   --web-base https://github.company.com
 ```
+
+**Differences from GHEC:**
+
+- **`--enterprise`** - enterprise org discovery via GraphQL works on GHES. Requires `read:enterprise` or `admin:enterprise` scope. You can still use `--orgs-file` as an alternative if preferred.
+- **No automated app installation** - `--install-app` relies on the GHEC enterprise API and will not work on GHES. Use `out/manual_install_links.csv` to install the app org by org.
+- **Outbound access to GitHub.com required for `--import-repo`** - the Veracode template repository lives at `github.com/veracode/github-actions-integration`. The script clones from there and pushes to your GHES instance. If your GHES environment does not allow outbound connections to GitHub.com, the import step will fail. In that case, mirror the template repo internally first and point the script at your internal copy, or pre-populate the `veracode` repos manually before running without `--import-repo`.
+- **Everything else works the same** - teams injection, secrets management, checkpoint/resume, and audit reporting all behave identically.
+
+---
 
 ## Console Output
 
@@ -458,68 +379,45 @@ python script.py --apply --import-repo --set-secrets \
 ============================================================
 MODE: APPLY
 ============================================================
-  Import missing repos: YES
+  Import missing repos  : YES
   Set teams in workflows: YES
-  Install missing apps: YES
-  Set Veracode secrets: YES
-    Enterprise: acme-corp
-    App Client ID: Iv1.xxxxx
-    Veracode API ID: SET
-    Veracode API Key: SET
+  Install missing apps  : YES
+  Set Veracode secrets  : YES
+    Enterprise          : acme-corp
+    App Client ID       : Iv1.xxxxx
+    VERACODE_API_ID     : SET  (admin - for API calls)
+    VERACODE_API_KEY    : SET  (admin - for API calls)
+    VERACODE_SA_API_ID  : SET  (service account - stored in orgs)
+    VERACODE_SA_API_KEY : SET  (service account - stored in orgs)
 ============================================================
 
-Attempting to discover orgs via enterprise GraphQL API: enterprise(slug: "acme-corp")
-[OK] Found 15 orgs via GraphQL API
+[teams-map] Loaded 15 org→teams mappings from out/teams_map.csv
+[OK] Found 15 orgs via GraphQL
 
+[1/15 (6.7%)] Processing: acme-dev
 [acme-dev] Repo: ✓  App: ✓  Secrets: ✓ (set 3)
-[acme-staging] Repo: ✓ (teams_added_to_2_files)  App: ✗  Secrets: ✓ (all exist)
-[acme-prod] Repo: ✓  App: ✓  Secrets: ✓ (set 2, existed 1)
 
-Outputs written to: C:\Users\...\omnicom-gh-onboarder\out
- - audit_report.json
- - missing_veracode_repo.csv
- - missing_workflow_app.csv
- - manual_install_links.csv
+[2/15 (13.3%)] Processing: acme-staging
+[acme-staging] Repo: ✓ (teams_added_to_2_files)  App: ✗  Secrets: ✓ (all exist)
 ```
 
-### Status Indicators
-- `✓` Present/Success
-- `✗` Missing/Failed
-- `(teams_added_to_2_files)` Teams parameter injected into workflow files
-- `(all exist)` Secrets already existed, no changes needed
-- `(set 3)` Three new secrets created
-- `(set 2, existed 1)` Two secrets created, one already existed
+**Status indicators:** `✓` success / `✗` missing or failed / `(teams_added_to_2_files)` injected / `(teams_already_present)` skipped / `(set 3)` new secrets / `(all exist)` no changes needed
 
-## Manual App Installation
-
-If automated installation fails or isn't available:
-
-1. Open `out/manual_install_links.csv` in Excel
-2. Click the install link for each org
-3. Approve the installation
-4. Done!
-
-Links are pre-filled with org information for one-click installation.
+---
 
 ## Security Notes
-- Secrets are encrypted using GitHub's public key API
+- Admin credentials (`VERACODE_API_ID/KEY`) are used only for API calls and never stored
+- Service account credentials (`VERACODE_SA_API_ID/KEY`) are encrypted via GitHub's public key API before being set
 - Agent tokens are unique per organization
-- `GITHUB_TOKEN` is passed via environment variable — never hardcode in source
-- No secrets are logged or stored locally
-- Default mode is read-only (dry-run)
-- All changes require explicit `--apply` flag
+- All credentials passed via environment variables - never hardcode in source
+- Default mode is read-only (dry-run); all changes require explicit `--apply`
+
+---
 
 ## Support
 
-Supported platforms:
-- GitHub.com
-- GitHub Enterprise Cloud (GHEC)
-- GitHub Enterprise Server (GHES)
-- Enterprise Managed Users (EMU)
+Supported: GitHub.com · GitHub Enterprise Cloud (GHEC) · GitHub Enterprise Server (GHES) · Enterprise Managed Users (EMU)
 
-For issues, provide:
-- `out/audit_report.json`
-- Platform type (GHEC/GHES/EMU)
-- Command used
+For issues provide `out/audit_report.json`, platform type, and command used.
 
-Note: This is a community tool and is not officially supported by Veracode.
+> This is a community tool and is not officially supported by Veracode.
