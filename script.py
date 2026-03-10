@@ -58,7 +58,7 @@ def check_rate_limit(response: requests.Response) -> None:
             time.sleep(wait_seconds)
 
 
-def request(method: str, url: str, token: str, max_retries: int = 3, **kwargs) -> requests.Response:
+def request(method: str, url: str, token: str, max_retries: int = 5, **kwargs) -> requests.Response:
     """GitHub API request with 429 handling and exponential backoff on 5xx/network errors."""
     for attempt in range(max_retries):
         try:
@@ -75,7 +75,7 @@ def request(method: str, url: str, token: str, max_retries: int = 3, **kwargs) -
 
             if r.status_code >= 500:
                 if attempt < max_retries - 1:
-                    wait_seconds = (2 ** attempt) * 2
+                    wait_seconds = min((2 ** attempt) * 2, 30)
                     print(f"  [SERVER ERROR] {r.status_code}, waiting {wait_seconds}s (retry {attempt + 1}/{max_retries})...")
                     time.sleep(wait_seconds)
                     continue
@@ -85,7 +85,7 @@ def request(method: str, url: str, token: str, max_retries: int = 3, **kwargs) -
 
         except requests.exceptions.Timeout:
             if attempt < max_retries - 1:
-                wait_seconds = (2 ** attempt) * 2
+                wait_seconds = min((2 ** attempt) * 2, 30)
                 print(f"  [TIMEOUT] waiting {wait_seconds}s (retry {attempt + 1}/{max_retries})...")
                 time.sleep(wait_seconds)
                 continue
@@ -93,7 +93,7 @@ def request(method: str, url: str, token: str, max_retries: int = 3, **kwargs) -
 
         except requests.exceptions.RequestException as exc:
             if attempt < max_retries - 1:
-                wait_seconds = (2 ** attempt) * 2
+                wait_seconds = min((2 ** attempt) * 2, 30)
                 print(f"  [NETWORK ERROR] {str(exc)[:50]}, waiting {wait_seconds}s (retry {attempt + 1}/{max_retries})...")
                 time.sleep(wait_seconds)
                 continue
@@ -107,7 +107,7 @@ def veracode_request(
     endpoint: str,
     api_id: str,
     api_key: str,
-    max_retries: int = 3,
+    max_retries: int = 5,
     **kwargs,
 ) -> requests.Response:
     """Veracode API request using HMAC signing, with the same retry/backoff logic as request()."""
@@ -130,7 +130,7 @@ def veracode_request(
 
             if r.status_code >= 500:
                 if attempt < max_retries - 1:
-                    wait_seconds = (2 ** attempt) * 2
+                    wait_seconds = min((2 ** attempt) * 2, 30)
                     print(f"  [VERACODE SERVER ERROR] {r.status_code}, waiting {wait_seconds}s (retry {attempt + 1}/{max_retries})...")
                     time.sleep(wait_seconds)
                     continue
@@ -140,7 +140,7 @@ def veracode_request(
 
         except requests.exceptions.Timeout:
             if attempt < max_retries - 1:
-                wait_seconds = (2 ** attempt) * 2
+                wait_seconds = min((2 ** attempt) * 2, 30)
                 print(f"  [VERACODE TIMEOUT] waiting {wait_seconds}s (retry {attempt + 1}/{max_retries})...")
                 time.sleep(wait_seconds)
                 continue
@@ -148,7 +148,7 @@ def veracode_request(
 
         except requests.exceptions.RequestException as exc:
             if attempt < max_retries - 1:
-                wait_seconds = (2 ** attempt) * 2
+                wait_seconds = min((2 ** attempt) * 2, 30)
                 print(f"  [VERACODE NETWORK ERROR] {str(exc)[:50]}, waiting {wait_seconds}s (retry {attempt + 1}/{max_retries})...")
                 time.sleep(wait_seconds)
                 continue
