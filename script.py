@@ -1235,8 +1235,7 @@ def main() -> None:
     total_orgs = len(orgs)
     report_path = outdir / "audit_report.json"
 
-    if report_path.exists():
-        report_path.unlink()
+    # audit_report.json is append-only - each run adds entries without clearing previous runs
 
     missing_repo_rows: List[List[str]] = []
     missing_app_rows: List[List[str]] = []
@@ -1311,8 +1310,8 @@ def main() -> None:
 
         write_report_entry(report_path, entry)
 
-        repo_status = "+" if entry.get("veracode_repo", {}).get("present") else "x"
-        app_status = "+" if entry.get("workflow_app", {}).get("installed") else "x"
+        repo_status = "✓" if entry.get("veracode_repo", {}).get("present") else "✗"
+        app_status = "✓" if entry.get("workflow_app", {}).get("installed") else "✗"
         teams_detail = ""
         if do_set_teams:
             injection = entry.get("veracode_repo", {}).get("teams_injection")
@@ -1328,25 +1327,24 @@ def main() -> None:
                 set_count = sum(1 for v in r.values() if v == "set")
                 exists_count = sum(1 for v in r.values() if v == "exists")
                 if exists_count == 3:
-                    secrets_status = "  Secrets: + (all exist)"
+                    secrets_status = "  Secrets: ✓ (all exist)"
                 elif set_count > 0:
-                    secrets_status = f"  Secrets: + (set {set_count}, existed {exists_count})"
+                    secrets_status = f"  Secrets: ✓ (set {set_count}, existed {exists_count})"
                 else:
-                    secrets_status = "  Secrets: +"
+                    secrets_status = "  Secrets: ✓"
             else:
-                secrets_status = "  Secrets: x"
+                secrets_status = "  Secrets: ✗"
         print(f"[{org}] Repo: {repo_status}{teams_detail}  App: {app_status}{secrets_status}")
 
         abs_processed = start_index + org_idx
-        if org_idx % 10 == 0:
-            try:
-                checkpoint_file.write_text(
-                    json.dumps({"last_org": org, "processed": abs_processed}, indent=2),
-                    encoding="utf-8",
-                    newline="\n",
-                )
-            except Exception as exc:
-                print(f"  [WARNING] Failed to save checkpoint: {exc}")
+        try:
+            checkpoint_file.write_text(
+                json.dumps({"last_org": org, "processed": abs_processed}, indent=2),
+                encoding="utf-8",
+                newline="\n",
+            )
+        except Exception as exc:
+            print(f"  [WARNING] Failed to save checkpoint: {exc}")
 
     write_csv(outdir / "missing_veracode_repo.csv", ["organization", "repo_name", "note"], missing_repo_rows)
     write_csv(outdir / "missing_workflow_app.csv", ["organization", "app_slug", "note"], missing_app_rows)
