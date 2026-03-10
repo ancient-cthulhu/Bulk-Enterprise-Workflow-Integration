@@ -236,6 +236,7 @@ def git_mirror_import(
     target_repo: str,
     token: str,
     web_base: str = "https://github.com",
+    git_timeout: int = 300,
 ) -> Tuple[bool, str]:
     """Bare-clone source_url and mirror-push to the target GitHub repo."""
     temp_dir: Optional[str] = None
@@ -246,7 +247,7 @@ def git_mirror_import(
 
         clone_result = subprocess.run(
             ["git", "clone", "--bare", source_url, bare_repo],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, timeout=git_timeout,
         )
         if clone_result.returncode != 0:
             return False, f"Clone failed: {clone_result.stderr}"
@@ -256,7 +257,7 @@ def git_mirror_import(
 
         push_result = subprocess.run(
             ["git", "-C", bare_repo, "push", "--mirror", target_url],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, timeout=git_timeout,
         )
         if push_result.returncode != 0:
             return False, f"Push failed: {push_result.stderr}"
@@ -282,18 +283,29 @@ def git_mirror_import(
 def create_veracode_workspace(org_name: str, api_id: str, api_key: str) -> Optional[str]:
     """Return the workspace ID for org_name, creating it if it does not exist."""
     try:
-        r = veracode_request("GET", "/srcclr/v3/workspaces", api_id, api_key)
+        page = 1
+        while True:
+            r = veracode_request("GET", f"/srcclr/v3/workspaces?page={page}&size=100", api_id, api_key)
 
-        if r.status_code == 200:
-            for ws in r.json().get("_embedded", {}).get("workspaces", []):
+            if r.status_code == 401:
+                print("  [ERROR] Veracode authentication failed — check credentials")
+                return None
+            if r.status_code == 403:
+                print("  [ERROR] Veracode permission denied — insufficient access")
+                return None
+            if r.status_code != 200:
+                break
+
+            data = r.json()
+            for ws in data.get("_embedded", {}).get("workspaces", []):
                 if ws.get("name") == org_name:
                     return ws.get("id")
-        elif r.status_code == 401:
-            print("  [ERROR] Veracode authentication failed — check credentials")
-            return None
-        elif r.status_code == 403:
-            print("  [ERROR] Veracode permission denied — insufficient access")
-            return None
+
+            page_info = data.get("page", {})
+            total_pages = page_info.get("totalPages", 1)
+            if page >= total_pages:
+                break
+            page += 1
 
         r = veracode_request("POST", "/srcclr/v3/workspaces", api_id, api_key, json={"name": org_name})
 
@@ -498,11 +510,16 @@ def set_veracode_secrets(
             if ok:
                 time.sleep(0.5)
                 verified = secret_exists(api_base, org, github_token, secret_name)
+                if not verified:
+                    print(f"  [WARNING] {secret_name} was set but could not be verified — check org permissions")
                 results[secret_name] = "set" if verified else "set_unverified"
             else:
                 results[secret_name] = "failed"
 
     all_ok = all(v in ("set", "exists") for v in results.values())
+    unverified = [k for k, v in results.items() if v == "set_unverified"]
+    if unverified:
+        print(f"  [WARNING] Secrets set but unverified (may still be ok): {', '.join(unverified)}")
     return all_ok, results
 
 
@@ -680,35 +697,6 @@ def check_main_branch_exists(api_base: str, org: str, repo: str, token: str) -> 
         return False
 
 
-def get_import_status(api_base: str, org: str, repo: str, token: str) -> dict:
-    r = request("GET", f"{api_base}/repos/{org}/{repo}/import", token)
-    if r.status_code == 200:
-        return r.json()
-    raise RuntimeError(f"{org}/{repo}: import status failed {r.status_code} {r.text}")
-
-
-def wait_for_import(
-    api_base: str,
-    org: str,
-    repo: str,
-    token: str,
-    timeout_s: int = 900,
-    poll_s: int = 5,
-) -> dict:
-    """Poll the GitHub import API until complete, failed, or timeout."""
-    deadline = time.time() + timeout_s
-    last: dict = {}
-    while time.time() < deadline:
-        last = get_import_status(api_base, org, repo, token)
-        status = (last.get("status") or "").lower()
-        if status in ("complete", "succeeded"):
-            return last
-        if status in ("failed", "error"):
-            raise RuntimeError(f"{org}/{repo}: import failed: {last}")
-        time.sleep(poll_s)
-    raise RuntimeError(f"{org}/{repo}: import timed out; last={last}")
-
-
 # ---------------------------------------------------------------------------
 # Workflow file injection
 # ---------------------------------------------------------------------------
@@ -866,6 +854,7 @@ def ensure_veracode_repo_imported(
     import_timeout_s: int = 900,
     import_poll_s: int = 5,
     web_base: str = "https://github.com",
+    git_timeout: int = 300,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Ensure the Veracode integration repo exists and is populated.
 
@@ -901,7 +890,7 @@ def ensure_veracode_repo_imported(
             print(f"  [{org}] Git CLI not available — skipping auto import")
             auto_import = False
         else:
-            ok, message = git_mirror_import(INTEGRATION_SOURCE_URL, org, INTEGRATION_REPO_NAME, token, web_base=web_base)
+            ok, message = git_mirror_import(INTEGRATION_SOURCE_URL, org, INTEGRATION_REPO_NAME, token, web_base=web_base, git_timeout=git_timeout)
             if ok:
                 time.sleep(2)
                 if check_main_branch_exists(api_base, org, INTEGRATION_REPO_NAME, token):
@@ -1121,6 +1110,8 @@ def main() -> None:
                     help="Repo import timeout in seconds (default: 900).")
     ap.add_argument("--import-poll", type=int, default=5,
                     help="Repo import poll interval in seconds (default: 5).")
+    ap.add_argument("--git-timeout", type=int, default=300,
+                    help="Timeout in seconds for each git clone/push operation (default: 300).")
 
     ap.add_argument("--skip-to", help="Skip all orgs before this one and start from here.")
     ap.add_argument("--continue", dest="resume", action="store_true",
@@ -1138,7 +1129,7 @@ def main() -> None:
 
     if args.apply and args.set_secrets:
         try:
-            import nacl  
+            import nacl  # noqa: F401
         except ImportError:
             print("ERROR: --set-secrets requires pynacl.  Install with: pip install pynacl", file=sys.stderr)
             sys.exit(1)
@@ -1263,6 +1254,7 @@ def main() -> None:
                 import_timeout_s=args.import_timeout,
                 import_poll_s=args.import_poll,
                 web_base=web_base,
+                git_timeout=args.git_timeout,
             )
             entry["veracode_repo"] = {"present": repo_ok, **repo_details}
             if not repo_ok:
@@ -1287,6 +1279,14 @@ def main() -> None:
             entry["workflow_app"] = {"installed": None, "status": "error", "error": str(exc)}
             missing_app_rows.append([org, APP_SLUG, f"error:{exc}"])
             print(f"[{org}] App error: {str(exc)[:80]}")
+
+        if args.dry_run and args.set_secrets:
+            try:
+                secret_names = ["VERACODE_API_ID", "VERACODE_API_KEY", "VERACODE_AGENT_TOKEN"]
+                dry_results = {s: ("exists" if secret_exists(api_base, org, token, s) else "missing") for s in secret_names}
+                entry["secrets"] = {"status": "dry_run", "results": dry_results}
+            except Exception as exc:
+                entry["secrets"] = {"status": "error", "error": str(exc)}
 
         if do_set_secrets:
             try:
