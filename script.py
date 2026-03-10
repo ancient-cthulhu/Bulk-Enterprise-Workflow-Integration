@@ -1188,8 +1188,14 @@ def main() -> None:
     else:
         orgs = all_orgs
 
-    write_orgs_txt(outdir / "orgs.txt", orgs)
-    write_teams_map_csv(outdir / "teams_map.csv", orgs)
+    orgs_txt_path = outdir / "orgs.txt"
+    teams_map_csv_path = outdir / "teams_map.csv"
+
+    if args.dry_run or not orgs_txt_path.exists():
+        write_orgs_txt(orgs_txt_path, orgs)
+
+    if args.dry_run or not teams_map_csv_path.exists():
+        write_teams_map_csv(teams_map_csv_path, orgs)
 
     checkpoint_file = outdir / "checkpoint.json"
     start_index = 0
@@ -1296,7 +1302,11 @@ def main() -> None:
         app_status = "+" if entry.get("workflow_app", {}).get("installed") else "x"
         teams_detail = ""
         if do_set_teams:
-            teams_detail = f" ({entry.get('veracode_repo', {}).get('teams_injection', 'n/a')})"
+            injection = entry.get("veracode_repo", {}).get("teams_injection")
+            if teams_value:
+                teams_detail = f" ({injection})" if injection else " (teams_injection_error)"
+            else:
+                teams_detail = " (no teams configured)"
         secrets_status = ""
         if do_set_secrets:
             s = entry.get("secrets", {})
