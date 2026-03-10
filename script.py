@@ -180,7 +180,7 @@ def paginate_list(url: str, token: str, params: Optional[dict] = None) -> List[d
         out.extend(data)
         link = r.headers.get("Link") or r.headers.get("link")
         url = parse_link_next(link) if link else None
-        params = None  # only pass params on the first request; subsequent pages are fully specified by the Link URL
+        params = None
     return out
 
 
@@ -206,7 +206,6 @@ def write_report_entry(report_path: Path, entry: Dict[str, Any]) -> None:
     if not report_path.exists():
         report_path.write_text("[\n" + json.dumps(entry, indent=2) + "\n]\n", encoding="utf-8")
         return
-    # Open r+b to read the trailing bytes and overwrite them in one handle
     with report_path.open("r+b") as f:
         f.seek(0, 2)
         size = f.tell()
@@ -237,9 +236,7 @@ def git_mirror_import(
     target_repo: str,
     token: str,
 ) -> Tuple[bool, str]:
-    """Bare-clone source_url and mirror-push to the target GitHub repo.
-
-    """
+    """Bare-clone source_url and mirror-push to the target GitHub repo."""
     temp_dir: Optional[str] = None
 
     try:
@@ -475,17 +472,18 @@ def set_veracode_secrets(
     api_base: str,
     org: str,
     github_token: str,
-    veracode_api_id: str,
-    veracode_api_key: str,
+    sa_api_id: str,
+    sa_api_key: str,
     veracode_agent_token: str,
 ) -> Tuple[bool, Dict[str, str]]:
     """Set VERACODE_API_ID, VERACODE_API_KEY, and VERACODE_AGENT_TOKEN for an org.
 
+    sa_api_id/sa_api_key are the service account credentials stored as secrets.
     Skips secrets that already exist. Returns (all_ok, per-secret status dict).
     """
     secrets_to_set = {
-        "VERACODE_API_ID": veracode_api_id,
-        "VERACODE_API_KEY": veracode_api_key,
+        "VERACODE_API_ID": sa_api_id,
+        "VERACODE_API_KEY": sa_api_key,
         "VERACODE_AGENT_TOKEN": veracode_agent_token,
     }
     results: Dict[str, str] = {}
@@ -513,11 +511,12 @@ def set_veracode_secrets(
 def list_orgs_graphql(api_base: str, token: str, enterprise: str) -> Optional[List[str]]:
     """Enumerate all orgs in a GitHub Enterprise via GraphQL. Returns logins or None on failure."""
     try:
-        graphql_url = (
-            "https://api.github.com/graphql"
-            if "api.github.com" in api_base
-            else f"{api_base.rstrip('/')}/graphql"
-        )
+        if "api.github.com" in api_base:
+            graphql_url = "https://api.github.com/graphql"
+        else:
+            # GHES REST base is .../api/v3 but GraphQL lives at .../api/graphql
+            graphql_base = re.sub(r"/api/v3$", "/api", api_base.rstrip("/"))
+            graphql_url = f"{graphql_base}/graphql"
 
         query = """
         query($enterprise: String!, $cursor: String) {
@@ -712,18 +711,16 @@ def wait_for_import(
 # Workflow file injection
 # ---------------------------------------------------------------------------
 
-def _inject_teams_regex(content: str, org: str) -> Tuple[str, bool]:
-    """Inject 'teams: "<org>"' as the first param in every uploadandscan-action with: block.
+def _inject_teams_regex(content: str, teams_value: str) -> Tuple[str, bool]:
+    """Inject 'teams: "<teams_value>"' as the first param in every uploadandscan-action with: block.
 
-    Handles steps with and without a `name:` field (the dash may be on a
-    preceding `- name:` line, making `uses:` appear without a dash).
+    teams_value can be a single name or a comma-separated list (e.g. "team-a,team-b").
+    Handles steps with and without a `name:` field preceding `uses:`.
     Idempotent — skips blocks that already contain a `teams:` key.
     """
     pattern = re.compile(
-        # `(?:-[ \t]+)?` makes the list-item dash optional to handle both
-        # `- uses: ...` and `uses: ...` (when `- name:` precedes it)
         r"([ \t]*(?:-[ \t]+)?uses:[ \t]+veracode/(?:veracode-)?uploadandscan-action@[^\n]+\n"
-        r"(?:[ \t]+[^\n]+\n)*?"  # optional sibling keys (id:, etc.) before with:
+        r"(?:[ \t]+[^\n]+\n)*?"
         r"[ \t]+with:\n)"
         r"((?:[ \t]+[^\n]+\n)+)",
         re.MULTILINE,
@@ -739,19 +736,29 @@ def _inject_teams_regex(content: str, org: str) -> Tuple[str, bool]:
         first_param = body.splitlines()[0]
         indent = len(first_param) - len(first_param.lstrip())
         changed = True
-        return header + " " * indent + f'teams: "{org}"\n' + body
+        return header + " " * indent + f'teams: "{teams_value}"\n' + body
 
     return pattern.sub(replacer, content), changed
 
 
-def inject_teams_into_workflows(api_base: str, org: str, repo: str, token: str) -> Tuple[bool, str]:
-    """Inject the teams parameter into the policy and sandbox scan workflow files."""
+def inject_teams_into_workflows(
+    api_base: str,
+    org: str,
+    repo: str,
+    token: str,
+    teams_value: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Inject the teams parameter into the policy and sandbox scan workflow files.
+
+    teams_value overrides the default of using the org name as the team.
+    """
     from base64 import b64decode, b64encode
 
     workflow_files = [
         ".github/workflows/veracode-sandbox-scan.yml",
         ".github/workflows/veracode-policy-scan.yml",
     ]
+    effective_teams = teams_value or org
     modified_count = 0
 
     for workflow_path in workflow_files:
@@ -765,7 +772,7 @@ def inject_teams_into_workflows(api_base: str, org: str, repo: str, token: str) 
         raw_content = b64decode(file_data.get("content", "")).decode("utf-8")
 
         try:
-            new_content, was_changed = _inject_teams_regex(raw_content, org)
+            new_content, was_changed = _inject_teams_regex(raw_content, effective_teams)
         except Exception as exc:
             print(f"  [{org}] Regex injection error for {workflow_path}: {exc}")
             continue
@@ -815,7 +822,6 @@ def inject_veracode_yml(api_base: str, org: str, repo: str, token: str) -> Tuple
         original_sha = original_data.get("sha")
         original_content_b64 = original_data.get("content", "")
 
-        # Back up the original as default-veracode.yml
         r_default = request("GET", default_veracode_url, token)
         backup_payload: Dict[str, Any] = {
             "message": "Preserve original Veracode template as default-veracode.yml",
@@ -854,12 +860,14 @@ def ensure_veracode_repo_imported(
     do_apply: bool,
     auto_import: bool = False,
     set_teams: bool = False,
+    teams_value: Optional[str] = None,
     import_timeout_s: int = 900,
     import_poll_s: int = 5,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Ensure the Veracode integration repo exists and is populated.
 
     Returns (present, details). In dry-run mode (do_apply=False) only reports status.
+    teams_value overrides the org name when injecting the teams parameter.
     """
     details: Dict[str, Any] = {"repo": INTEGRATION_REPO_NAME}
     exists = repo_exists(api_base, org, INTEGRATION_REPO_NAME, token)
@@ -867,7 +875,9 @@ def ensure_veracode_repo_imported(
     if exists and not repo_is_empty(api_base, org, INTEGRATION_REPO_NAME, token):
         details["status"] = "repo_exists"
         if set_teams:
-            _ok, teams_msg = inject_teams_into_workflows(api_base, org, INTEGRATION_REPO_NAME, token)
+            _ok, teams_msg = inject_teams_into_workflows(
+                api_base, org, INTEGRATION_REPO_NAME, token, teams_value=teams_value
+            )
             details["teams_injection"] = teams_msg
         return True, details
 
@@ -899,7 +909,7 @@ def ensure_veracode_repo_imported(
                     if set_teams:
                         time.sleep(1)
                         _ok, teams_msg = inject_teams_into_workflows(
-                            api_base, org, INTEGRATION_REPO_NAME, token
+                            api_base, org, INTEGRATION_REPO_NAME, token, teams_value=teams_value
                         )
                         details["teams_injection"] = teams_msg
                     return True, details
@@ -1028,6 +1038,44 @@ def ensure_app_installed(
 
 
 # ---------------------------------------------------------------------------
+# Teams map helpers (--set-teams-file)
+# ---------------------------------------------------------------------------
+
+def generate_teams_map(orgs: List[str], output_path: Path) -> None:
+    """Write a teams_map.csv template for the user to fill in.
+
+    Columns: org, teams
+    The teams column accepts a comma-separated list of Veracode team names.
+    Leave a row's teams column blank to skip injection for that org.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+        writer.writerow(["org", "teams"])
+        for org in orgs:
+            writer.writerow([org, ""])
+    print(f"[teams-map] Generated {output_path} with {len(orgs)} orgs")
+    print(f"[teams-map] Fill in the 'teams' column (comma-separated team names), then re-run:")
+    print(f"[teams-map]   python script.py --apply --set-teams-file {output_path}")
+
+
+def load_teams_map(path: str) -> Dict[str, str]:
+    """Load a teams_map.csv and return {org: teams_value}.
+
+    Orgs with a blank teams column are excluded — teams injection is skipped for them.
+    """
+    teams_map: Dict[str, str] = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            org = (row.get("org") or "").strip()
+            teams = (row.get("teams") or "").strip()
+            if org and teams:
+                teams_map[org] = teams
+    return teams_map
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -1045,8 +1093,15 @@ def main() -> None:
                     help="[apply] Attempt enterprise installation of the Veracode Workflow App.")
     ap.add_argument("--set-secrets", action="store_true",
                     help="[apply] Set VERACODE_API_ID, VERACODE_API_KEY, VERACODE_AGENT_TOKEN secrets.")
-    ap.add_argument("--set-teams", action="store_true",
-                    help="[apply + --import-repo] Inject teams parameter into workflow files.")
+    ap.add_argument("--set-teams-auto", action="store_true",
+                    help="[apply] Inject teams parameter using the org name as the team value.")
+    ap.add_argument("--set-teams-file", metavar="FILE",
+                    help=(
+                        "Teams map CSV workflow. "
+                        "Dry-run (no FILE needed): discovers orgs and writes out/teams_map.csv with a blank teams column. "
+                        "Apply (FILE required): reads the CSV and injects per-org team values. "
+                        "Teams column accepts comma-separated team names."
+                    ))
 
     ap.add_argument("--enterprise", help="GitHub Enterprise slug.")
     ap.add_argument("--app-client-id", help="GitHub App client ID (required for --install-app).")
@@ -1074,6 +1129,11 @@ def main() -> None:
     if not args.dry_run and not args.apply:
         args.dry_run = True
 
+    if args.apply and args.set_teams_file is None and "--set-teams-file" in sys.argv:
+        print("ERROR: --set-teams-file requires a FILE path in apply mode.", file=sys.stderr)
+        print("  Example: --apply --set-teams-file out/teams_map.csv", file=sys.stderr)
+        sys.exit(1)
+
     if args.apply and args.set_secrets:
         try:
             import nacl  # noqa: F401
@@ -1094,15 +1154,23 @@ def main() -> None:
     do_apply_repo = bool(args.apply and args.import_repo)
     do_apply_app = bool(args.apply and args.install_app)
     do_set_secrets = bool(args.apply and args.set_secrets)
-    do_set_teams = bool(args.apply and args.set_teams)
+    do_set_teams = bool(args.apply and (args.set_teams_auto or args.set_teams_file))
 
     veracode_api_id = env("VERACODE_API_ID") if do_set_secrets else None
     veracode_api_key = env("VERACODE_API_KEY") if do_set_secrets else None
+    veracode_sa_api_id = env("VERACODE_SA_API_ID") if do_set_secrets else None
+    veracode_sa_api_key = env("VERACODE_SA_API_KEY") if do_set_secrets else None
 
     if do_set_secrets and (not veracode_api_id or not veracode_api_key):
-        print("ERROR: --set-secrets requires VERACODE_API_ID and VERACODE_API_KEY env vars.", file=sys.stderr)
+        print("ERROR: --set-secrets requires VERACODE_API_ID and VERACODE_API_KEY env vars (admin credentials for API calls).", file=sys.stderr)
         print("  Windows:   set VERACODE_API_ID=...  /  set VERACODE_API_KEY=...", file=sys.stderr)
         print("  Linux/Mac: export VERACODE_API_ID=...  /  export VERACODE_API_KEY=...", file=sys.stderr)
+        sys.exit(1)
+
+    if do_set_secrets and (not veracode_sa_api_id or not veracode_sa_api_key):
+        print("ERROR: --set-secrets requires VERACODE_SA_API_ID and VERACODE_SA_API_KEY env vars (service account credentials to store in orgs).", file=sys.stderr)
+        print("  Windows:   set VERACODE_SA_API_ID=...  /  set VERACODE_SA_API_KEY=...", file=sys.stderr)
+        print("  Linux/Mac: export VERACODE_SA_API_ID=...  /  export VERACODE_SA_API_KEY=...", file=sys.stderr)
         sys.exit(1)
 
     print(f"\n{'=' * 60}")
@@ -1110,15 +1178,17 @@ def main() -> None:
     print(f"{'=' * 60}")
     if args.apply:
         print(f"  Import missing repos : {'YES' if do_apply_repo else 'NO (--import-repo)'}")
-        print(f"  Set teams in workflows: {'YES' if do_set_teams else 'NO (--set-teams)'}")
+        print(f"  Set teams in workflows: {'YES' if do_set_teams else 'NO (--set-teams-auto / --set-teams-file)'}")
         print(f"  Install missing apps : {'YES' if do_apply_app else 'NO (--install-app)'}")
         print(f"  Set Veracode secrets : {'YES' if do_set_secrets else 'NO (--set-secrets)'}")
         if do_apply_app:
             print(f"    Enterprise   : {enterprise or 'NOT SET (required for app install)'}")
             print(f"    App Client ID: {client_id or 'NOT SET (required for app install)'}")
         if do_set_secrets:
-            print(f"    VERACODE_API_ID : {'SET' if veracode_api_id else 'NOT SET'}")
-            print(f"    VERACODE_API_KEY: {'SET' if veracode_api_key else 'NOT SET'}")
+            print(f"    VERACODE_API_ID     : {'SET' if veracode_api_id else 'NOT SET'}  (admin — for API calls)")
+            print(f"    VERACODE_API_KEY    : {'SET' if veracode_api_key else 'NOT SET'}  (admin — for API calls)")
+            print(f"    VERACODE_SA_API_ID  : {'SET' if veracode_sa_api_id else 'NOT SET'}  (service account — stored in orgs)")
+            print(f"    VERACODE_SA_API_KEY : {'SET' if veracode_sa_api_key else 'NOT SET'}  (service account — stored in orgs)")
     else:
         print("  No changes will be made (use --apply to enable changes)")
     print(f"{'=' * 60}\n")
@@ -1127,6 +1197,15 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     orgs = list_orgs(api_base, token, enterprise, args.orgs_file)
+
+    if args.set_teams_file is not None and args.dry_run:
+        generate_teams_map(orgs, outdir / "teams_map.csv")
+        sys.exit(0)
+
+    teams_map: Dict[str, str] = {}
+    if args.set_teams_file and args.apply:
+        teams_map = load_teams_map(args.set_teams_file)
+        print(f"[teams-map] Loaded {len(teams_map)} org→teams mappings from {args.set_teams_file}\n")
 
     checkpoint_file = outdir / "checkpoint.json"
     start_index = 0
@@ -1168,12 +1247,15 @@ def main() -> None:
 
         entry: Dict[str, Any] = {"org": org}
 
+        teams_value: Optional[str] = teams_map.get(org) if args.set_teams_file else None
+
         try:
             repo_ok, repo_details = ensure_veracode_repo_imported(
                 api_base, org, token,
                 do_apply=do_apply_repo,
                 auto_import=do_apply_repo,
                 set_teams=do_set_teams,
+                teams_value=teams_value,
                 import_timeout_s=args.import_timeout,
                 import_poll_s=args.import_poll,
             )
@@ -1212,14 +1294,13 @@ def main() -> None:
                         entry["secrets"] = {"status": "error", "error": "Failed to generate agent token"}
                     else:
                         ok, results = set_veracode_secrets(
-                            api_base, org, token, veracode_api_id, veracode_api_key, agent_token
+                            api_base, org, token, veracode_sa_api_id, veracode_sa_api_key, agent_token
                         )
                         entry["secrets"] = {"status": "set" if ok else "partial", "results": results}
             except Exception as exc:
                 entry["secrets"] = {"status": "error", "error": str(exc)}
                 print(f"[{org}] Secrets error: {str(exc)[:80]}")
 
-        # Write immediately so a crash doesn't lose completed results
         write_report_entry(report_path, entry)
 
         repo_status = "✓" if entry.get("veracode_repo", {}).get("present") else "✗"
@@ -1241,7 +1322,6 @@ def main() -> None:
                 secrets_status = "  Secrets: ✗"
         print(f"[{org}] Repo: {repo_status}  App: {app_status}{secrets_status}")
 
-        # Save checkpoint every 10 orgs so --continue can resume from here
         abs_processed = start_index + org_idx
         if org_idx % 10 == 0:
             try:
