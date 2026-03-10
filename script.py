@@ -1285,7 +1285,7 @@ def main() -> None:
             missing_app_rows.append([org, APP_SLUG, f"error:{exc}"])
             print(f"[{org}] App error: {str(exc)[:80]}")
 
-        if args.dry_run and args.set_secrets:
+        if args.dry_run:
             try:
                 secret_names = ["VERACODE_API_ID", "VERACODE_API_KEY", "VERACODE_AGENT_TOKEN"]
                 dry_results = {s: ("exists" if secret_exists(api_base, org, token, s) else "missing") for s in secret_names}
@@ -1330,6 +1330,17 @@ def main() -> None:
                     secrets_status = "  Secrets: ✓"
             else:
                 secrets_status = "  Secrets: ✗"
+        elif args.dry_run:
+            s = entry.get("secrets", {})
+            if s.get("status") == "dry_run":
+                results = s.get("results", {})
+                missing = [k for k, v in results.items() if v == "missing"]
+                if not missing:
+                    secrets_status = "  Secrets: ✓ (all exist)"
+                else:
+                    secrets_status = f"  Secrets: ✗ ({len(missing)} missing)"
+            elif s.get("status") == "error":
+                secrets_status = "  Secrets: ? (check error)"
         print(f"[{org}] Repo: {repo_status}  App: {app_status}{secrets_status}")
 
         abs_processed = start_index + org_idx
