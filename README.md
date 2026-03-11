@@ -236,7 +236,7 @@ The injected `veracode.yml` is pre-configured for onboarding:
 analysis_on_platform: true
 break_build_policy_findings: false   # don't fail pipelines during onboarding
 break_build_invalid_policy: false
-break_build_on_error: true           # still fail on scan errors
+break_build_on_error: false          
 policy: 'Omnicom Base Policy'
 issues:
   trigger: true
