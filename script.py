@@ -512,13 +512,13 @@ def check_veracode_secrets_status(
     """Check which Veracode secrets exist without setting them."""
     secret_names = ["VERACODE_API_ID", "VERACODE_API_KEY", "VERACODE_AGENT_TOKEN"]
     results: Dict[str, str] = {}
-    
+
     for secret_name in secret_names:
         if secret_exists(api_base, org, github_token, secret_name):
             results[secret_name] = "exists"
         else:
             results[secret_name] = "missing"
-    
+
     return results
 
 
@@ -1054,13 +1054,13 @@ def validate_credentials(
     check_veracode: bool,
 ) -> Tuple[bool, List[str]]:
     """Validate GitHub and optionally Veracode credentials before processing.
-    
+
     Returns: (success: bool, errors: List[str])
     """
     errors: List[str] = []
-    
+
     print("\n[VALIDATION] Checking credentials...")
-    
+
     # Test GitHub token
     try:
         r = request("GET", f"{api_base}/user", token)
@@ -1080,8 +1080,8 @@ def validate_credentials(
     except Exception as exc:
         errors.append(f"GitHub API connection failed: {str(exc)[:100]}")
         print(f"  ✗ GitHub API connection error: {str(exc)[:80]}")
-    
-    # Test GitHub token scopes
+
+    # Report GitHub token scopes if available
     try:
         r = request("GET", f"{api_base}/user", token)
         if r.status_code == 200:
@@ -1092,7 +1092,7 @@ def validate_credentials(
                 print(f"  ⚠ Could not determine GitHub token scopes")
     except Exception:
         pass
-    
+
     # Test Veracode credentials if required
     if check_veracode and veracode_api_id and veracode_api_key:
         try:
@@ -1111,7 +1111,7 @@ def validate_credentials(
         except Exception as exc:
             errors.append(f"Veracode API connection failed: {str(exc)[:100]}")
             print(f"  ✗ Veracode API connection error: {str(exc)[:80]}")
-    
+
     if errors:
         print(f"\n[VALIDATION] ✗ Failed with {len(errors)} error(s)")
         return False, errors
@@ -1283,6 +1283,7 @@ def main() -> None:
 
     all_orgs = list_orgs(api_base, token, enterprise, args.orgs_file)
 
+    # When both --enterprise and --orgs-file are given, filter down to the listed orgs only.
     if args.orgs_file and enterprise:
         try:
             with open(args.orgs_file, encoding="utf-8") as f:
@@ -1291,8 +1292,8 @@ def main() -> None:
             print(f"[OK] Filtered to {len(filtered)} orgs from {args.orgs_file}")
             orgs = filtered
         except Exception as exc:
-            print(f"[WARNING] Could not apply orgs-file filter: {exc}")
-            orgs = all_orgs
+            print(f"[ERROR] Could not apply orgs-file filter: {exc}", file=sys.stderr)
+            sys.exit(1)
     else:
         orgs = all_orgs
 
@@ -1345,8 +1346,8 @@ def main() -> None:
         print(f"Processing {len(orgs)} remaining organizations\n")
 
     total_orgs = len(orgs)
-    
-    # Add confirmation prompt for --apply mode
+
+    # Skip confirmation on --continue: user already confirmed on the initial run.
     if args.apply and not args.resume:
         print(f"\n{'=' * 60}")
         print(f"⚠️  CONFIRMATION REQUIRED")
@@ -1354,25 +1355,23 @@ def main() -> None:
         print(f"About to modify {total_orgs} organizations in APPLY mode.")
         print(f"Actions enabled:")
         if do_apply_repo:
-            print(f"  • Create and import veracode repos")
+            print(f"  - Create and import veracode repos")
         if do_set_teams:
-            print(f"  • Inject teams parameters into workflows")
+            print(f"  - Inject teams parameters into workflows")
         if do_apply_app:
-            print(f"  • Install Veracode Workflow App")
+            print(f"  - Install Veracode Workflow App")
         if do_set_secrets:
-            print(f"  • Set organization secrets")
+            print(f"  - Set organization secrets")
         print(f"\nType 'yes' to continue (anything else will cancel): ", end="")
         confirmation = input().strip().lower()
-        if confirmation != 'yes':
+        if confirmation != "yes":
             print("\n[CANCELLED] Operation cancelled by user.")
             sys.exit(0)
         print(f"{'=' * 60}\n")
-    
-    # Create timestamped audit report for this run
+
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = outdir / f"audit_report_{run_timestamp}.json"
 
-    # Initialize statistics tracking
     stats = {
         "start_time": datetime.now(),
         "total_orgs": total_orgs,
@@ -1383,6 +1382,10 @@ def main() -> None:
         "app_fail": 0,
         "secrets_success": 0,
         "secrets_fail": 0,
+        "secrets_checked": 0,
+        "secrets_all_exist": 0,
+        "secrets_partial": 0,
+        "secrets_all_missing": 0,
     }
 
     missing_repo_rows: List[List[str]] = []
@@ -1393,17 +1396,16 @@ def main() -> None:
         progress_pct = (org_idx / total_orgs) * 100 if total_orgs else 100.0
         print(f"\n[{org_idx}/{total_orgs} ({progress_pct:.1f}%)] Processing: {org}")
 
-        # Create timestamp for this entry
         now = datetime.now()
         timestamp_iso = now.isoformat()
         timestamp_readable = now.strftime("%Y-%m-%d %H:%M:%S %A")
-        
+
         entry: Dict[str, Any] = {
             "org": org,
             "timestamp": timestamp_iso,
             "timestamp_readable": timestamp_readable
         }
-        
+
         stats["processed"] += 1
 
         if do_set_teams:
@@ -1460,20 +1462,25 @@ def main() -> None:
         if args.dry_run or do_set_secrets:
             try:
                 if args.dry_run:
-                    # In dry-run mode, just check what secrets exist
                     results = check_veracode_secrets_status(api_base, org, token)
-                    
+
                     missing_count = sum(1 for v in results.values() if v == "missing")
                     exists_count = sum(1 for v in results.values() if v == "exists")
 
+                    stats["secrets_checked"] += 1
                     if missing_count == 0:
-                        entry["secrets"] = {"status": "all_exist", "results": results}
+                        status = "all_exist"
+                        stats["secrets_all_exist"] += 1
                     elif exists_count == 0:
-                        entry["secrets"] = {"status": "all_missing", "results": results}
+                        status = "all_missing"
+                        stats["secrets_all_missing"] += 1
                     else:
-                        entry["secrets"] = {"status": "partial", "results": results}
+                        status = "partial"
+                        stats["secrets_partial"] += 1
 
-                elif do_set_secrets:                    # In apply mode with --set-secrets, create workspace and set secrets
+                    entry["secrets"] = {"status": status, "results": results}
+
+                elif do_set_secrets:
                     workspace_id = create_veracode_workspace(org, veracode_api_id, veracode_api_key)
                     if not workspace_id:
                         entry["secrets"] = {"status": "error", "error": "Failed to create or find Veracode workspace"}
@@ -1513,7 +1520,7 @@ def main() -> None:
         if "secrets" in entry:
             s = entry.get("secrets", {})
             status = s.get("status", "")
-            
+
             if status == "all_exist":
                 secrets_status = "  Secrets: ✓ (all exist)"
             elif status == "all_missing":
@@ -1553,12 +1560,10 @@ def main() -> None:
     write_csv(outdir / "missing_workflow_app.csv", ["organization", "app_slug", "note"], missing_app_rows)
     write_csv(outdir / "manual_install_links.csv", ["organization", "install_link", "reason"], manual_links_rows)
 
-    # Calculate final statistics
     stats["end_time"] = datetime.now()
     stats["duration"] = stats["end_time"] - stats["start_time"]
-    duration_str = str(stats["duration"]).split(".")[0] 
+    duration_str = str(stats["duration"]).split(".")[0]
 
-    # Generate summary report
     print(f"\n{'=' * 70}")
     print(f"EXECUTION SUMMARY")
     print(f"{'=' * 70}")
@@ -1569,22 +1574,27 @@ def main() -> None:
     print(f"")
     print(f"Organizations   : {stats['processed']}/{stats['total_orgs']} processed")
     print(f"")
-    
+
     if stats["repo_success"] > 0 or stats["repo_fail"] > 0:
         repo_total = stats["repo_success"] + stats["repo_fail"]
         repo_pct = (stats["repo_success"] / repo_total * 100) if repo_total > 0 else 0
         print(f"Veracode Repos  : {stats['repo_success']} success, {stats['repo_fail']} failed ({repo_pct:.1f}% success)")
-    
+
     if stats["app_success"] > 0 or stats["app_fail"] > 0:
         app_total = stats["app_success"] + stats["app_fail"]
         app_pct = (stats["app_success"] / app_total * 100) if app_total > 0 else 0
         print(f"Workflow Apps   : {stats['app_success']} success, {stats['app_fail']} failed ({app_pct:.1f}% success)")
-    
-    if stats["secrets_success"] > 0 or stats["secrets_fail"] > 0:
+
+    if args.dry_run and stats["secrets_checked"] > 0:
+        print(f"Secrets (check) : {stats['secrets_all_exist']} all exist, "
+              f"{stats['secrets_partial']} partial, "
+              f"{stats['secrets_all_missing']} all missing "
+              f"(of {stats['secrets_checked']} orgs checked)")
+    elif stats["secrets_success"] > 0 or stats["secrets_fail"] > 0:
         secrets_total = stats["secrets_success"] + stats["secrets_fail"]
         secrets_pct = (stats["secrets_success"] / secrets_total * 100) if secrets_total > 0 else 0
         print(f"Secrets         : {stats['secrets_success']} success, {stats['secrets_fail']} failed ({secrets_pct:.1f}% success)")
-    
+
     print(f"{'=' * 70}")
 
     print("\nOutputs written to:", outdir.resolve())
@@ -1598,7 +1608,7 @@ def main() -> None:
     if missing_repo_rows or missing_app_rows:
         print(f"\n  Note: {len(missing_repo_rows)} org(s) have missing repos, {len(missing_app_rows)} org(s) have missing apps")
         print(f"    See CSV files above for details and actions needed.")
-    
+
     sys.exit(0)
 
 
