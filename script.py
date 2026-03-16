@@ -1350,7 +1350,7 @@ def main() -> None:
     # Skip confirmation on --continue: user already confirmed on the initial run.
     if args.apply and not args.resume:
         print(f"\n{'=' * 60}")
-        print(f"⚠️  CONFIRMATION REQUIRED")
+        print(f"   CONFIRMATION REQUIRED")
         print(f"{'=' * 60}")
         print(f"About to modify {total_orgs} organizations in APPLY mode.")
         print(f"Actions enabled:")
