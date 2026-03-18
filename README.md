@@ -35,7 +35,7 @@ All operations are idempotent - safe to re-run.
 ```bash
 export GITHUB_TOKEN="..."
 
-python script.py --enterprise YOUR-ENTERPRISE
+python rollout_helper.py --enterprise YOUR-ENTERPRISE
 ```
 
 Discovers all orgs, checks current state, and writes output files to `./out/`:
@@ -52,7 +52,7 @@ export VERACODE_API_KEY="admin_api_key"
 export VERACODE_SA_API_ID="service_account_api_id"
 export VERACODE_SA_API_KEY="service_account_api_key"
 
-python script.py --apply \
+python rollout_helper.py --apply \
   --enterprise YOUR-ENTERPRISE \
   --import-repo \
   --set-teams-file out/teams_map.csv \
@@ -96,10 +96,10 @@ Admin credentials are never stored. Service account credentials are what gets de
 | Dry-run | `read:org`, `admin:org` |
 | `--enterprise` (org discovery) | + `read:enterprise` |
 | `--import-repo` / `--set-teams-*` | + `repo`, `workflow` |
+| `--update-veracode-yml` | + `repo`, `workflow` |
 | `--set-secrets` | `admin:org` *(already covered above)* |
 
 Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`, `workflow`
-
 
 ---
 
@@ -113,7 +113,8 @@ Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`,
 | `--set-teams-auto` | Inject `teams: "<org-name>"` for every org |
 | `--set-teams-file FILE` | Inject per-org team values from `teams_map.csv`. Blank rows are skipped. |
 | `--set-teams-hybrid FILE` | Same as `--set-teams-file` but blank rows fall back to the org name |
-| `--set-secrets` | Set `VERACODE_API_ID`, `VERACODE_API_KEY`, `VERACODE_AGENT_TOKEN` per org |
+| `--set-secrets` | Set `VERACODE_API_ID`, `VERACODE_API_KEY`, `VERACODE_AGENT_TOKEN` per org. Always overwrites - safe to re-run for credential rotation. |
+| `--update-veracode-yml [FILE]` | Push a `veracode.yml` to the `veracode` repo in every org. By default fetches `veracode.yml` directly from the upstream integration repo (`github.com/veracode/github-actions-integration`). Pass a local `FILE` path to use a custom file instead. The current file is backed up as `default-veracode.yml` first. Orgs with a missing or not-yet-imported repo are skipped with a warning. |
 
 ### Configuration
 
@@ -167,6 +168,42 @@ issues:
 
 Once onboarding is complete, re-enable gating by setting `break_build_policy_findings: true` and `break_build_invalid_policy: true`.
 
+### Bulk veracode.yml Update
+
+To push a new `veracode.yml` to all orgs after initial onboarding - for example to update the policy name, change scan triggers, or enable build gating across the fleet:
+
+```bash
+# Fetch veracode.yml from the upstream integration repo (default)
+python rollout_helper.py --apply --enterprise YOUR-ENTERPRISE --update-veracode-yml
+
+# Use a custom local file instead
+python rollout_helper.py --apply --enterprise YOUR-ENTERPRISE --update-veracode-yml /path/to/veracode.yml
+```
+
+With no file argument the script fetches `veracode.yml` directly from `github.com/veracode/github-actions-integration` at runtime, so it always pulls the latest upstream version without needing a local copy. Pass a local file path when you want to deploy a customized configuration.
+
+The current `veracode.yml` in each repo is preserved as `default-veracode.yml` before being overwritten. Orgs whose `veracode` repo is missing or not yet imported are skipped with a warning and counted separately in the summary.
+
+`--update-veracode-yml` is optional and independent of the other flags. It only appears in the mode header, per-org log line, and execution summary when it is actively used.
+
+---
+
+## Credential Rotation
+
+`--set-secrets` always overwrites all three secrets unconditionally, so re-running it with new credentials is all that is needed for annual rotation:
+
+```bash
+export GITHUB_TOKEN="..."
+export VERACODE_API_ID="admin_api_id"
+export VERACODE_API_KEY="admin_api_key"
+export VERACODE_SA_API_ID="new_service_account_api_id"
+export VERACODE_SA_API_KEY="new_service_account_api_key"
+
+python rollout_helper.py --apply --enterprise YOUR-ENTERPRISE --set-secrets
+```
+
+The SCA agent token (`VERACODE_AGENT_TOKEN`) is also rotated as part of this - the script calls `token:regenerate` on the existing agent for each org, which invalidates the old token and returns a fresh one.
+
 ---
 
 ## Organization Discovery
@@ -207,6 +244,10 @@ The script resolves orgs in this order:
     "status": "already_installed",
     "installation_id": 12345678
   },
+  "veracode_yml_update": {
+    "success": true,
+    "action": "updated_with_backup"
+  },
   "secrets": {
     "status": "set",
     "results": {
@@ -218,6 +259,8 @@ The script resolves orgs in this order:
 }
 ```
 
+`veracode_yml_update.action` values: `updated_with_backup`, `created`, `repo_not_found`, `repo_empty`, `put_failed:<status_code>`.
+
 ---
 
 ## Platform Notes
@@ -227,7 +270,7 @@ The script resolves orgs in this order:
 All features supported.
 
 ```bash
-python script.py --apply --import-repo --set-teams-file out/teams_map.csv \
+python rollout_helper.py --apply --import-repo --set-teams-file out/teams_map.csv \
   --set-secrets \
   --enterprise your-enterprise-slug
 ```
@@ -235,7 +278,7 @@ python script.py --apply --import-repo --set-teams-file out/teams_map.csv \
 ### GitHub Enterprise Server (GHES)
 
 ```bash
-python script.py --apply --import-repo --set-teams-file out/teams_map.csv --set-secrets \
+python rollout_helper.py --apply --import-repo --set-teams-file out/teams_map.csv --set-secrets \
   --enterprise your-enterprise-slug \
   --api-base https://github.company.com/api/v3 \
   --web-base https://github.company.com
@@ -253,10 +296,10 @@ For deployments across many orgs, use `--continue` to resume after interruption:
 
 ```bash
 # Initial run
-python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secrets
+python rollout_helper.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secrets
 
 # Resume after interruption
-python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secrets --continue
+python rollout_helper.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secrets --continue
 ```
 
 Checkpoint state is saved to `out/checkpoint.json` after each org. The `--continue` flag skips the confirmation prompt - confirmation was already given on the initial run.
@@ -269,8 +312,8 @@ Use `--skip-to ORG` to jump to a specific org without needing a checkpoint file.
 
 - Veracode admin credentials are used only for API calls and never stored anywhere
 - Service account credentials are encrypted via GitHub's public key API before being written to secrets
-- Agent tokens are unique per organization
-- All credentials are passed via environment variables and never hardcode in source
+- Agent tokens are unique per organization and regenerated on each `--set-secrets` run
+- All credentials are passed via environment variables and never hardcoded in source
 - Default mode is read-only; all changes require explicit `--apply`
 
 ---
