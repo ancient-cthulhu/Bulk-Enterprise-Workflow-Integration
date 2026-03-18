@@ -35,7 +35,7 @@ All operations are idempotent - safe to re-run.
 ```bash
 export GITHUB_TOKEN="..."
 
-python rollout_helper.py --enterprise YOUR-ENTERPRISE
+python script.py --enterprise YOUR-ENTERPRISE
 ```
 
 Discovers all orgs, checks current state, and writes output files to `./out/`:
@@ -52,7 +52,7 @@ export VERACODE_API_KEY="admin_api_key"
 export VERACODE_SA_API_ID="service_account_api_id"
 export VERACODE_SA_API_KEY="service_account_api_key"
 
-python rollout_helper.py --apply \
+python script.py --apply \
   --enterprise YOUR-ENTERPRISE \
   --import-repo \
   --set-teams-file out/teams_map.csv \
@@ -174,10 +174,10 @@ To push a new `veracode.yml` to all orgs after initial onboarding - for example 
 
 ```bash
 # Fetch veracode.yml from the upstream integration repo (default)
-python rollout_helper.py --apply --enterprise YOUR-ENTERPRISE --update-veracode-yml
+python script.py --apply --enterprise YOUR-ENTERPRISE --update-veracode-yml
 
 # Use a custom local file instead
-python rollout_helper.py --apply --enterprise YOUR-ENTERPRISE --update-veracode-yml /path/to/veracode.yml
+python script.py --apply --enterprise YOUR-ENTERPRISE --update-veracode-yml /path/to/veracode.yml
 ```
 
 With no file argument the script fetches `veracode.yml` directly from `github.com/veracode/github-actions-integration` at runtime, so it always pulls the latest upstream version without needing a local copy. Pass a local file path when you want to deploy a customized configuration.
@@ -199,7 +199,7 @@ export VERACODE_API_KEY="admin_api_key"
 export VERACODE_SA_API_ID="new_service_account_api_id"
 export VERACODE_SA_API_KEY="new_service_account_api_key"
 
-python rollout_helper.py --apply --enterprise YOUR-ENTERPRISE --set-secrets
+python script.py --apply --enterprise YOUR-ENTERPRISE --set-secrets
 ```
 
 The SCA agent token (`VERACODE_AGENT_TOKEN`) is also rotated as part of this - the script calls `token:regenerate` on the existing agent for each org, which invalidates the old token and returns a fresh one.
@@ -270,7 +270,7 @@ The script resolves orgs in this order:
 All features supported.
 
 ```bash
-python rollout_helper.py --apply --import-repo --set-teams-file out/teams_map.csv \
+python script.py --apply --import-repo --set-teams-file out/teams_map.csv \
   --set-secrets \
   --enterprise your-enterprise-slug
 ```
@@ -278,7 +278,7 @@ python rollout_helper.py --apply --import-repo --set-teams-file out/teams_map.cs
 ### GitHub Enterprise Server (GHES)
 
 ```bash
-python rollout_helper.py --apply --import-repo --set-teams-file out/teams_map.csv --set-secrets \
+python script.py --apply --import-repo --set-teams-file out/teams_map.csv --set-secrets \
   --enterprise your-enterprise-slug \
   --api-base https://github.company.com/api/v3 \
   --web-base https://github.company.com
@@ -296,10 +296,10 @@ For deployments across many orgs, use `--continue` to resume after interruption:
 
 ```bash
 # Initial run
-python rollout_helper.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secrets
+python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secrets
 
 # Resume after interruption
-python rollout_helper.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secrets --continue
+python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secrets --continue
 ```
 
 Checkpoint state is saved to `out/checkpoint.json` after each org. The `--continue` flag skips the confirmation prompt - confirmation was already given on the initial run.
