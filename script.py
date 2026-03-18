@@ -789,6 +789,18 @@ def list_orgs(
         except Exception as exc:
             raise RuntimeError(f"Enterprise API failed: {exc}")
 
+    if orgs_file:
+        print(f"Reading orgs from file: {orgs_file}")
+        try:
+            with open(orgs_file, encoding="utf-8") as f:
+                orgs = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+            if orgs:
+                print(f"[OK] Found {len(orgs)} orgs from file")
+                return orgs
+            errors.append(f"File '{orgs_file}' contains no valid org names")
+        except Exception as exc:
+            errors.append(f"File read failed: {exc}")
+
     try:
         print("Discovering orgs via /user/orgs (all orgs the token user belongs to)")
         org_objs = paginate_list(f"{api_base}/user/orgs", token, params={"per_page": 100})
@@ -799,18 +811,6 @@ def list_orgs(
         errors.append("User API returned no orgs")
     except Exception as exc:
         errors.append(f"User API failed: {exc}")
-
-    if orgs_file:
-        try:
-            print(f"Reading orgs from file: {orgs_file}")
-            with open(orgs_file, encoding="utf-8") as f:
-                orgs = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-            if orgs:
-                print(f"[OK] Found {len(orgs)} orgs from file")
-                return orgs
-            errors.append(f"File '{orgs_file}' contains no valid org names")
-        except Exception as exc:
-            errors.append(f"File read failed: {exc}")
 
     print("\n[ERROR] Unable to determine org list. Tried:", file=sys.stderr)
     for i, error in enumerate(errors, 1):
