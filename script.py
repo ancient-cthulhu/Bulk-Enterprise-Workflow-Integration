@@ -1258,7 +1258,7 @@ def main() -> None:
     if args.dry_run or not orgs_txt_path.exists():
         write_orgs_txt(orgs_txt_path, orgs)
 
-    if args.dry_run or not teams_map_csv_path.exists():
+    if not teams_map_csv_path.exists():
         write_teams_map_csv(teams_map_csv_path, orgs)
 
     validation_ok, validation_errors = validate_credentials(
@@ -1283,8 +1283,8 @@ def main() -> None:
             checkpoint_data = json.loads(checkpoint_file.read_text(encoding="utf-8"))
             last_org = checkpoint_data.get("last_org")
             if last_org and last_org in orgs:
-                start_index = orgs.index(last_org) + 1
-                print(f"[RESUME] Continuing after: {last_org}  (skipping {start_index} orgs)\n")
+                start_index = orgs.index(last_org)
+                print(f"[RESUME] Restarting from: {last_org}  (skipping {start_index} orgs)\n")
         except Exception as exc:
             print(f"[WARNING] Failed to load checkpoint: {exc}")
 
@@ -1361,6 +1361,16 @@ def main() -> None:
         }
 
         stats["processed"] += 1
+
+        abs_processed = start_index + org_idx
+        try:
+            checkpoint_file.write_text(
+                json.dumps({"last_org": org, "processed": abs_processed}, indent=2),
+                encoding="utf-8",
+                newline="\n",
+            )
+        except Exception as exc:
+            print(f"  [WARNING] Failed to save checkpoint: {exc}")
 
         if do_set_teams:
             if args.set_teams_auto:
@@ -1518,16 +1528,6 @@ def main() -> None:
                 secrets_status = "  Secrets: ✗"
 
         print(f"[{org}] Repo: {repo_status}{teams_detail}  App: {app_status}{yml_status}{secrets_status}")
-
-        abs_processed = start_index + org_idx
-        try:
-            checkpoint_file.write_text(
-                json.dumps({"last_org": org, "processed": abs_processed}, indent=2),
-                encoding="utf-8",
-                newline="\n",
-            )
-        except Exception as exc:
-            print(f"  [WARNING] Failed to save checkpoint: {exc}")
 
     write_csv(outdir / "missing_veracode_repo.csv", ["organization", "repo_name", "note"], missing_repo_rows)
     write_csv(outdir / "missing_workflow_app.csv", ["organization", "app_slug", "note"], missing_app_rows)
