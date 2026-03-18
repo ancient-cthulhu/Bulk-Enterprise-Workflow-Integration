@@ -13,7 +13,7 @@ For each organization, the script can:
 3. Inject `teams:` parameter into workflow files
 4. Create a Veracode SCA workspace, generate a unique agent token, and set GitHub Actions secrets
 
-All operations are idempotent - safe to re-run.
+All operations are idempotent - safe to re-run. If a repo import completes after the script times out, the next run detects the incomplete state via the absence of `default-veracode.yml` and automatically applies the missing post-import steps.
 
 > **App installation is manual.** The script checks whether `veracode-workflow-app` is installed per org and generates `manual_install_links.csv` with a direct install URL for each org that needs it. Automated installation via the GitHub API is not supported for third-party apps.
 
@@ -93,7 +93,7 @@ Admin credentials are never stored. Service account credentials are what gets de
 
 | Operation | Required Scopes |
 |-----------|----------------|
-| Dry-run | `read:org`, `admin:org` |
+| Dry-run | `read:org`, `admin:org` (`admin:org` required to check secret status - without it secrets show as `no_permission` in the report) |
 | `--enterprise` (org discovery) | + `read:enterprise` |
 | `--import-repo` / `--set-teams-*` | + `repo`, `workflow` |
 | `--update-veracode-yml` | + `repo`, `workflow` |
@@ -113,7 +113,7 @@ Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`,
 | `--set-teams-auto` | Inject `teams: "<org-name>"` for every org |
 | `--set-teams-file FILE` | Inject per-org team values from `teams_map.csv`. Blank rows are skipped. |
 | `--set-teams-hybrid FILE` | Same as `--set-teams-file` but blank rows fall back to the org name |
-| `--set-secrets` | Set `VERACODE_API_ID`, `VERACODE_API_KEY`, `VERACODE_AGENT_TOKEN` per org. Always overwrites - safe to re-run for credential rotation. |
+| `--set-secrets` | Set `VERACODE_API_ID`, `VERACODE_API_KEY`, `VERACODE_AGENT_TOKEN` per org. Always overwrites all three - safe to re-run for annual credential rotation. The SCA agent token is regenerated via `token:regenerate` on each run, invalidating the previous one. |
 | `--update-veracode-yml [FILE]` | Push a `veracode.yml` to the `veracode` repo in every org. By default fetches `veracode.yml` directly from the upstream integration repo (`github.com/veracode/github-actions-integration`). Pass a local `FILE` path to use a custom file instead. The current file is backed up as `default-veracode.yml` first. Orgs with a missing or not-yet-imported repo are skipped with a warning. |
 
 ### Configuration
@@ -147,6 +147,8 @@ Three modes are available:
 - **`--set-teams-hybrid`** - reads from `teams_map.csv`, falls back to org name for blank rows
 
 `teams_map.csv` is generated automatically on every dry-run. Fill in the `teams` column (comma-separated names accepted) and pass it back on apply. Files that already have `teams:` are left unchanged.
+
+The teams map is a lookup table, not a scope filter. Only orgs that are being processed (determined by `--enterprise`, `--orgs-file`, or `/user/orgs`) will be touched. If your orgs file has 1 org and your teams map has 100 entries, only the 1 org gets processed - using its matching entry from the map if one exists.
 
 ---
 
@@ -261,6 +263,10 @@ The script resolves orgs in this order:
 
 `veracode_yml_update.action` values: `updated_with_backup`, `created`, `repo_not_found`, `repo_empty`, `put_failed:<status_code>`.
 
+`veracode_repo.status` values: `repo_exists`, `repo_exists_post_import_incomplete` (imported but post-import steps never ran - self-healed on this run), `repo_created_and_imported`, `repo_created_import_incomplete` (push succeeded but main branch not found yet), `repo_created_manual_import_required`, `missing`.
+
+`secrets.status` values in dry-run: `all_exist`, `all_missing`, `partial`, `no_permission` (token lacks `admin:org` scope).
+
 ---
 
 ## Platform Notes
@@ -302,7 +308,7 @@ python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secret
 python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secrets --continue
 ```
 
-Checkpoint state is saved to `out/checkpoint.json` after each org. The `--continue` flag skips the confirmation prompt - confirmation was already given on the initial run.
+Checkpoint state is saved to `out/checkpoint.json` at the start of each org. If the script is interrupted mid-org, `--continue` restarts from that org so nothing is skipped. All operations are idempotent so re-running a completed org is safe. The `--continue` flag also skips the confirmation prompt - confirmation was already given on the initial run.
 
 Use `--skip-to ORG` to jump to a specific org without needing a checkpoint file.
 
