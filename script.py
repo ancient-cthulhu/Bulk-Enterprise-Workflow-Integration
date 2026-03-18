@@ -508,6 +508,7 @@ def set_veracode_secrets(
     all_ok = all(v.startswith("set") for v in results.values())
     return all_ok, results
 
+
 def _inject_teams_regex(content: str, org: str) -> Tuple[str, bool]:
     pattern = re.compile(
         r"([ \t]*(?:-[ \t]+)?uses:[ \t]+veracode/(?:veracode-)?uploadandscan-action@[^\n]+\n"
@@ -577,16 +578,28 @@ def inject_teams_into_workflows(api_base: str, org: str, repo: str, token: str, 
     return True, "teams_already_present"
 
 
+def fetch_upstream_veracode_yml() -> Optional[str]:
+    url = f"https://raw.githubusercontent.com/{INTEGRATION_SOURCE_URL.removeprefix('https://github.com/').removesuffix('.git')}/main/veracode.yml"
+    try:
+        r = requests.get(url, timeout=30)
+        if r.status_code == 200:
+            return r.text
+        print(f"  [ERROR] Failed to fetch upstream veracode.yml: HTTP {r.status_code}", file=sys.stderr)
+        return None
+    except requests.exceptions.RequestException as exc:
+        print(f"  [ERROR] Failed to fetch upstream veracode.yml: {exc}", file=sys.stderr)
+        return None
+
+
 def inject_veracode_yml(api_base: str, org: str, repo: str, token: str) -> Tuple[bool, str]:
-    from base64 import b64decode, b64encode
+    from base64 import b64encode
 
     template_path = Path(__file__).parent / "veracode.yml"
     if not template_path.exists():
-        print(f"  [{org}] Warning: veracode.yml template not found, skipping injection")
+        print(f"  [{org}] Warning: veracode.yml not found next to script, skipping injection")
         return False, "template_not_found"
 
-    with open(template_path, encoding="utf-8") as f:
-        custom_yml = f.read()
+    custom_yml = template_path.read_text(encoding="utf-8")
 
     veracode_url = f"{api_base}/repos/{org}/{repo}/contents/veracode.yml"
     default_veracode_url = f"{api_base}/repos/{org}/{repo}/contents/default-veracode.yml"
@@ -623,19 +636,6 @@ def inject_veracode_yml(api_base: str, org: str, repo: str, token: str) -> Tuple
             "branch": "main",
         })
         return (True, "created") if r.status_code in (200, 201) else (False, "failed")
-
-
-def fetch_upstream_veracode_yml() -> Optional[str]:
-    url = f"https://raw.githubusercontent.com/{INTEGRATION_SOURCE_URL.removeprefix('https://github.com/').removesuffix('.git')}/main/veracode.yml"
-    try:
-        r = requests.get(url, timeout=30)
-        if r.status_code == 200:
-            return r.text
-        print(f"  [ERROR] Failed to fetch upstream veracode.yml: HTTP {r.status_code}", file=sys.stderr)
-        return None
-    except requests.exceptions.RequestException as exc:
-        print(f"  [ERROR] Failed to fetch upstream veracode.yml: {exc}", file=sys.stderr)
-        return None
 
 
 def update_veracode_yml_in_repo(
@@ -884,7 +884,7 @@ def ensure_veracode_repo_imported(
             default_yml_url = f"{api_base}/repos/{org}/{INTEGRATION_REPO_NAME}/contents/default-veracode.yml"
             if request("GET", default_yml_url, token).status_code != 200:
                 details["status"] = "repo_exists_post_import_incomplete"
-                _run_post_import_steps()
+            _run_post_import_steps()
         return True, details
 
     if is_empty:
@@ -1157,6 +1157,15 @@ def main() -> None:
     do_set_teams = bool(args.apply and (args.set_teams_auto or args.set_teams_file or args.set_teams_hybrid))
     do_update_yml = bool(args.apply and args.update_veracode_yml is not None)
 
+    if do_apply_repo:
+        onboarding_yml_path = Path(__file__).parent / "veracode.yml"
+        if not onboarding_yml_path.exists():
+            print(f"[WARNING] veracode.yml not found next to script - repo will be imported but yml injection will be skipped.")
+            print(f"          Expected: {onboarding_yml_path.resolve()}", file=sys.stderr)
+            onboarding_yml_path = None
+        else:
+            print(f"[import-repo] Onboarding veracode.yml: {onboarding_yml_path.resolve()}")
+
     yml_content: Optional[str] = None
     yml_source_label: Optional[str] = None
     if do_update_yml:
@@ -1201,6 +1210,11 @@ def main() -> None:
     print(f"{'=' * 60}")
     if args.apply:
         print(f"  Import missing repos  : {'YES' if do_apply_repo else 'NO (--import-repo)'}")
+        if do_apply_repo:
+            if onboarding_yml_path:
+                print(f"    Onboarding YML      : {onboarding_yml_path.resolve()}")
+            else:
+                print(f"    Onboarding YML      : NOT FOUND - import only, yml injection skipped")
         if do_set_teams:
             if args.set_teams_auto:
                 print(f"  Set teams in workflows: YES (auto - org name)")
