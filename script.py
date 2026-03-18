@@ -333,7 +333,7 @@ def create_veracode_agent_token(
         suffix = "-agt"
         max_org_len = 20 - len(suffix)
         truncated_org = org_name[:max_org_len]
-        if not truncated_org[0].isalpha():
+        if not truncated_org or not truncated_org[0].isalpha():
             truncated_org = "gh" + truncated_org[:max_org_len - 2]
         agent_name = f"{truncated_org}{suffix}"
 
@@ -476,9 +476,9 @@ def check_veracode_secrets_status(
             elif r.status_code == 404:
                 results[secret_name] = "missing"
             else:
-                results[secret_name] = "missing"
+                results[secret_name] = "error"
         except Exception:
-            results[secret_name] = "missing"
+            results[secret_name] = "error"
 
     return results
 
@@ -631,13 +631,16 @@ def inject_veracode_yml(api_base: str, org: str, repo: str, token: str) -> Tuple
         })
         return (True, "updated_with_backup") if r.status_code in (200, 201) else (False, "failed")
 
-    else:
+    elif r.status_code == 404:
         r = request("PUT", veracode_url, token, json={
             "message": "Add Veracode workflow configuration",
             "content": b64encode(custom_yml.encode("utf-8")).decode("utf-8"),
             "branch": "main",
         })
         return (True, "created") if r.status_code in (200, 201) else (False, "failed")
+
+    else:
+        return False, f"get_failed:{r.status_code}"
 
 
 def update_veracode_yml_in_repo(
@@ -876,7 +879,7 @@ def ensure_veracode_repo_imported(
         if request("GET", default_yml_url, token).status_code == 200:
             return
         yml_ok, yml_action = inject_veracode_yml(api_base, org, INTEGRATION_REPO_NAME, token)
-        details["veracode_yml_injected"] = yml_action if yml_ok else "failed"
+        details["veracode_yml_injected"] = yml_action
         if teams_value:
             _ok, teams_msg = inject_teams_into_workflows(api_base, org, INTEGRATION_REPO_NAME, token, teams_value)
             details["teams_injection"] = teams_msg
@@ -884,10 +887,9 @@ def ensure_veracode_repo_imported(
     if exists and not is_empty:
         details["status"] = "repo_exists"
         if do_apply:
-            default_yml_url = f"{api_base}/repos/{org}/{INTEGRATION_REPO_NAME}/contents/default-veracode.yml"
-            if request("GET", default_yml_url, token).status_code != 200:
-                details["status"] = "repo_exists_post_import_incomplete"
             _run_post_import_steps()
+            if "veracode_yml_injected" in details:
+                details["status"] = "repo_exists_post_import_incomplete"
         return True, details
 
     if is_empty:
@@ -1394,7 +1396,7 @@ def main() -> None:
                 stats["repo_success"] += 1
             else:
                 stats["repo_fail"] += 1
-                missing_repo_rows.append([org, INTEGRATION_REPO_NAME, repo_details.get("note", "missing")])
+                missing_repo_rows.append([org, INTEGRATION_REPO_NAME, repo_details.get("status", "missing")])
         except Exception as exc:
             entry["veracode_repo"] = {"present": None, "status": "error", "error": str(exc)}
             missing_repo_rows.append([org, INTEGRATION_REPO_NAME, f"error:{exc}"])
@@ -1441,15 +1443,19 @@ def main() -> None:
                     no_permission_count = sum(1 for v in results.values() if v == "no_permission")
                     missing_count = sum(1 for v in results.values() if v == "missing")
                     exists_count = sum(1 for v in results.values() if v == "exists")
+                    error_count = sum(1 for v in results.values() if v == "error")
 
                     stats["secrets_checked"] += 1
                     if no_permission_count == 3:
                         status = "no_permission"
                         stats["secrets_no_permission"] += 1
-                    elif missing_count == 0 and no_permission_count == 0:
+                    elif error_count == 3:
+                        status = "error"
+                        stats["secrets_fail"] += 1
+                    elif missing_count == 0 and no_permission_count == 0 and error_count == 0:
                         status = "all_exist"
                         stats["secrets_all_exist"] += 1
-                    elif exists_count == 0 and no_permission_count == 0:
+                    elif exists_count == 0 and no_permission_count == 0 and error_count == 0:
                         status = "all_missing"
                         stats["secrets_all_missing"] += 1
                     else:
