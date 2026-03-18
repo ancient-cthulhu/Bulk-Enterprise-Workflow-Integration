@@ -226,7 +226,7 @@ def git_mirror_import(
 
         clone_result = subprocess.run(
             ["git", "clone", "--bare", source_url, bare_repo],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True,
         )
         if clone_result.returncode != 0:
             return False, f"Clone failed: {clone_result.stderr}"
@@ -235,15 +235,13 @@ def git_mirror_import(
 
         push_result = subprocess.run(
             ["git", "-C", bare_repo, "push", "--mirror", target_url],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True,
         )
         if push_result.returncode != 0:
             return False, f"Push failed: {push_result.stderr}"
 
         return True, "Import successful"
 
-    except subprocess.TimeoutExpired:
-        return False, "Timeout during git operation"
     except Exception as exc:
         return False, str(exc)
     finally:
@@ -429,7 +427,7 @@ def secret_exists(api_base: str, org: str, token: str, secret_name: str) -> bool
         if r.status_code == 404:
             return False
         if r.status_code == 403:
-            print(f"  [{org}] Warning: no permission to check secret {secret_name}")
+            print(f"  [{org}] Cannot check secret {secret_name}: token lacks admin:org scope (read:enterprise is not sufficient)")
             return False
         print(f"  [{org}] Unexpected response checking {secret_name}: {r.status_code}")
         return False
@@ -473,14 +471,23 @@ def check_veracode_secrets_status(
     org: str,
     github_token: str,
 ) -> Dict[str, str]:
-    # Read-only check used in dry-run. Returns "exists" or "missing" per secret.
+    # Read-only check used in dry-run. Returns "exists", "missing", or "no_permission" per secret.
+    # "no_permission" means the token lacks admin:org scope - read:enterprise alone is not sufficient.
     secret_names = ["VERACODE_API_ID", "VERACODE_API_KEY", "VERACODE_AGENT_TOKEN"]
     results: Dict[str, str] = {}
 
     for secret_name in secret_names:
-        if secret_exists(api_base, org, github_token, secret_name):
-            results[secret_name] = "exists"
-        else:
+        try:
+            r = request("GET", f"{api_base}/orgs/{org}/actions/secrets/{secret_name}", github_token)
+            if r.status_code == 200:
+                results[secret_name] = "exists"
+            elif r.status_code == 403:
+                results[secret_name] = "no_permission"
+            elif r.status_code == 404:
+                results[secret_name] = "missing"
+            else:
+                results[secret_name] = "missing"
+        except Exception:
             results[secret_name] = "missing"
 
     return results
@@ -494,7 +501,6 @@ def set_veracode_secrets(
     veracode_sa_api_key: str,
     veracode_agent_token: str,
 ) -> Tuple[bool, Dict[str, str]]:
-    # Always overwrites all three secrets. Safe to re-run for credential rotation.
     secrets_to_set = {
         "VERACODE_API_ID": veracode_sa_api_id,
         "VERACODE_API_KEY": veracode_sa_api_key,
@@ -632,7 +638,6 @@ def inject_veracode_yml(api_base: str, org: str, repo: str, token: str) -> Tuple
 
 
 def fetch_upstream_veracode_yml() -> Optional[str]:
-    # Fetches veracode.yml directly from the upstream integration repo.
     url = f"https://raw.githubusercontent.com/{INTEGRATION_SOURCE_URL.removeprefix('https://github.com/').removesuffix('.git')}/main/veracode.yml"
     try:
         r = requests.get(url, timeout=30)
@@ -652,8 +657,6 @@ def update_veracode_yml_in_repo(
     token: str,
     yml_content: str,
 ) -> Tuple[bool, str]:
-    # Overwrites veracode.yml in the repo, backing up the current file as default-veracode.yml first.
-    # Skips with a warning if the repo is missing or not yet imported.
     from base64 import b64encode
 
     if not repo_exists(api_base, org, repo, token):
@@ -674,7 +677,6 @@ def update_veracode_yml_in_repo(
         original_sha = original_data.get("sha")
         original_content_b64 = original_data.get("content", "")
 
-        # Back up current veracode.yml as default-veracode.yml before overwriting.
         r_default = request("GET", default_veracode_url, token)
         backup_payload: Dict[str, Any] = {
             "message": "Preserve current veracode.yml as default-veracode.yml before update",
@@ -864,34 +866,6 @@ def check_main_branch_exists(api_base: str, org: str, repo: str, token: str) -> 
         return False
 
 
-def get_import_status(api_base: str, org: str, repo: str, token: str) -> dict:
-    r = request("GET", f"{api_base}/repos/{org}/{repo}/import", token)
-    if r.status_code == 200:
-        return r.json()
-    raise RuntimeError(f"{org}/{repo}: import status failed {r.status_code} {r.text}")
-
-
-def wait_for_import(
-    api_base: str,
-    org: str,
-    repo: str,
-    token: str,
-    timeout_s: int = 900,
-    poll_s: int = 5,
-) -> dict:
-    deadline = time.time() + timeout_s
-    last: dict = {}
-    while time.time() < deadline:
-        last = get_import_status(api_base, org, repo, token)
-        status = (last.get("status") or "").lower()
-        if status in ("complete", "succeeded"):
-            return last
-        if status in ("failed", "error"):
-            raise RuntimeError(f"{org}/{repo}: import failed: {last}")
-        time.sleep(poll_s)
-    raise RuntimeError(f"{org}/{repo}: import timed out; last={last}")
-
-
 def ensure_veracode_repo_imported(
     api_base: str,
     org: str,
@@ -899,20 +873,33 @@ def ensure_veracode_repo_imported(
     do_apply: bool,
     auto_import: bool = False,
     teams_value: Optional[str] = None,
-    import_timeout_s: int = 900,
-    import_poll_s: int = 5,
 ) -> Tuple[bool, Dict[str, Any]]:
     details: Dict[str, Any] = {"repo": INTEGRATION_REPO_NAME}
     exists = repo_exists(api_base, org, INTEGRATION_REPO_NAME, token)
+    is_empty = exists and repo_is_empty(api_base, org, INTEGRATION_REPO_NAME, token)
 
-    if exists and not repo_is_empty(api_base, org, INTEGRATION_REPO_NAME, token):
-        details["status"] = "repo_exists"
+    def _run_post_import_steps() -> None:
+        # default-veracode.yml is only present after inject_veracode_yml has run successfully.
+        # Check for it first so re-runs don't overwrite a repo that's already fully set up.
+        default_yml_url = f"{api_base}/repos/{org}/{INTEGRATION_REPO_NAME}/contents/default-veracode.yml"
+        if request("GET", default_yml_url, token).status_code == 200:
+            return
+        yml_ok, yml_action = inject_veracode_yml(api_base, org, INTEGRATION_REPO_NAME, token)
+        details["veracode_yml_injected"] = yml_action if yml_ok else "failed"
         if teams_value:
             _ok, teams_msg = inject_teams_into_workflows(api_base, org, INTEGRATION_REPO_NAME, token, teams_value)
             details["teams_injection"] = teams_msg
+
+    if exists and not is_empty:
+        details["status"] = "repo_exists"
+        if do_apply:
+            default_yml_url = f"{api_base}/repos/{org}/{INTEGRATION_REPO_NAME}/contents/default-veracode.yml"
+            if request("GET", default_yml_url, token).status_code != 200:
+                details["status"] = "repo_exists_post_import_incomplete"
+                _run_post_import_steps()
         return True, details
 
-    if exists:
+    if is_empty:
         details["was_empty"] = True
 
     details["status"] = "missing"
@@ -933,22 +920,14 @@ def ensure_veracode_repo_imported(
             if ok:
                 time.sleep(2)
                 if check_main_branch_exists(api_base, org, INTEGRATION_REPO_NAME, token):
-                    yml_ok, yml_action = inject_veracode_yml(api_base, org, INTEGRATION_REPO_NAME, token)
                     details["status"] = "repo_created_and_imported"
                     details["import_method"] = "git_cli_auto"
-                    details["veracode_yml_injected"] = yml_action if yml_ok else "failed"
-                    if teams_value:
-                        time.sleep(1)
-                        _ok, teams_msg = inject_teams_into_workflows(
-                            api_base, org, INTEGRATION_REPO_NAME, token, teams_value
-                        )
-                        details["teams_injection"] = teams_msg
+                    _run_post_import_steps()
                     return True, details
                 else:
                     print(f"  [{org}] Warning: main branch not found after import")
-                    details["status"] = "repo_created_and_imported"
+                    details["status"] = "repo_created_import_incomplete"
                     details["import_method"] = "git_cli_auto"
-                    details["veracode_yml_injected"] = False
                     return True, details
             else:
                 print(f"  [{org}] Auto import failed: {message}")
@@ -1160,11 +1139,6 @@ def main() -> None:
     ap.add_argument("--token-env", default="GITHUB_TOKEN",
                     help="Environment variable holding the GitHub PAT (default: GITHUB_TOKEN).")
 
-    ap.add_argument("--import-timeout", type=int, default=900,
-                    help="Repo import timeout in seconds (default: 900).")
-    ap.add_argument("--import-poll", type=int, default=5,
-                    help="Repo import poll interval in seconds (default: 5).")
-
     ap.add_argument("--skip-to", help="Skip all orgs before this one and start from here.")
     ap.add_argument("--continue", dest="resume", action="store_true",
                     help="Resume from the last checkpoint saved in checkpoint.json.")
@@ -1200,7 +1174,6 @@ def main() -> None:
     if do_update_yml:
         raw_path = args.update_veracode_yml
         if raw_path:
-            # Explicit local file provided.
             local_path = Path(raw_path)
             if not local_path.exists():
                 print(f"ERROR: --update-veracode-yml file not found: {local_path}", file=sys.stderr)
@@ -1208,7 +1181,6 @@ def main() -> None:
             yml_content = local_path.read_text(encoding="utf-8")
             yml_source_label = str(local_path.resolve())
         else:
-            # No path given - fetch veracode.yml from the upstream integration repo.
             print("[update-veracode-yml] Fetching veracode.yml from upstream integration repo...")
             yml_content = fetch_upstream_veracode_yml()
             if not yml_content:
@@ -1367,6 +1339,7 @@ def main() -> None:
         "secrets_all_exist": 0,
         "secrets_partial": 0,
         "secrets_all_missing": 0,
+        "secrets_no_permission": 0,
         "yml_updated": 0,
         "yml_skipped": 0,
         "yml_failed": 0,
@@ -1405,8 +1378,6 @@ def main() -> None:
                 do_apply=do_apply_repo,
                 auto_import=do_apply_repo,
                 teams_value=teams_value,
-                import_timeout_s=args.import_timeout,
-                import_poll_s=args.import_poll,
             )
             entry["veracode_repo"] = {"present": repo_ok, **repo_details}
             if repo_ok:
@@ -1457,14 +1428,18 @@ def main() -> None:
                 if args.dry_run:
                     results = check_veracode_secrets_status(api_base, org, token)
 
+                    no_permission_count = sum(1 for v in results.values() if v == "no_permission")
                     missing_count = sum(1 for v in results.values() if v == "missing")
                     exists_count = sum(1 for v in results.values() if v == "exists")
 
                     stats["secrets_checked"] += 1
-                    if missing_count == 0:
+                    if no_permission_count == 3:
+                        status = "no_permission"
+                        stats["secrets_no_permission"] += 1
+                    elif missing_count == 0 and no_permission_count == 0:
                         status = "all_exist"
                         stats["secrets_all_exist"] += 1
-                    elif exists_count == 0:
+                    elif exists_count == 0 and no_permission_count == 0:
                         status = "all_missing"
                         stats["secrets_all_missing"] += 1
                     else:
@@ -1524,7 +1499,9 @@ def main() -> None:
             s = entry.get("secrets", {})
             status = s.get("status", "")
 
-            if status == "all_exist":
+            if status == "no_permission":
+                secrets_status = "  Secrets: ⚠ (no_permission - token needs admin:org scope)"
+            elif status == "all_exist":
                 secrets_status = "  Secrets: ✓ (all exist)"
             elif status == "all_missing":
                 secrets_status = "  Secrets: ✗ (all missing)"
@@ -1587,8 +1564,10 @@ def main() -> None:
     if args.dry_run and stats["secrets_checked"] > 0:
         print(f"Secrets (check) : {stats['secrets_all_exist']} all exist, "
               f"{stats['secrets_partial']} partial, "
-              f"{stats['secrets_all_missing']} all missing "
-              f"(of {stats['secrets_checked']} orgs checked)")
+              f"{stats['secrets_all_missing']} all missing, "
+              f"{stats['secrets_no_permission']} no_permission "
+              f"(of {stats['secrets_checked']} orgs checked)"
+              + ("" if stats['secrets_no_permission'] == 0 else " - add admin:org scope to check secrets"))
     elif stats["secrets_success"] > 0 or stats["secrets_fail"] > 0:
         secrets_total = stats["secrets_success"] + stats["secrets_fail"]
         secrets_pct = (stats["secrets_success"] / secrets_total * 100) if secrets_total > 0 else 0
