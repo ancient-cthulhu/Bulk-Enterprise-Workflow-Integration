@@ -22,10 +22,6 @@ INTEGRATION_SOURCE_URL = "https://github.com/veracode/github-actions-integration
 API_VER = "2022-11-28"
 
 
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
-
 def env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name)
     return v if v not in (None, "") else default
@@ -180,10 +176,6 @@ def paginate_list(url: str, token: str, params: Optional[dict] = None) -> List[d
     return out
 
 
-# ---------------------------------------------------------------------------
-# Output helpers
-# ---------------------------------------------------------------------------
-
 def write_csv(path: Path, header: List[str], rows: List[List[str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -211,10 +203,6 @@ def write_report_entry(report_path: Path, entry: Dict[str, Any]) -> None:
         newline="\n",
     )
 
-
-# ---------------------------------------------------------------------------
-# Git / repo import helpers
-# ---------------------------------------------------------------------------
 
 def check_git_available() -> bool:
     try:
@@ -266,12 +254,8 @@ def git_mirror_import(
                 pass
 
 
-# ---------------------------------------------------------------------------
-# Veracode SCA workspace and agent helpers
-# ---------------------------------------------------------------------------
-
 def _find_workspace_by_name(org_name: str, api_id: str, api_key: str) -> Optional[str]:
-    """Walk all pages of GET /v3/workspaces using filter[workspace] and return the workspace UUID."""
+    # Pages through workspaces until an exact name match is found; returns the UUID or None.
     page = 0
     while True:
         r = veracode_request(
@@ -304,11 +288,7 @@ def _find_workspace_by_name(org_name: str, api_id: str, api_key: str) -> Optiona
 
 
 def create_veracode_workspace(org_name: str, api_id: str, api_key: str) -> Optional[str]:
-    """Return the workspace UUID for org_name, creating it if it does not exist.
-
-    POST /v3/workspaces returns a ResponseEntity envelope with no workspace ID in the body.
-    The UUID is resolved via a follow-up GET with filter[workspace]=name.
-    """
+    # POST /v3/workspaces returns no ID in the body; UUID is resolved via follow-up GET.
     try:
         existing_id = _find_workspace_by_name(org_name, api_id, api_key)
         if existing_id:
@@ -333,11 +313,6 @@ def create_veracode_workspace(org_name: str, api_id: str, api_key: str) -> Optio
 
 
 def list_veracode_agents(workspace_id: str, api_id: str, api_key: str) -> Optional[List[dict]]:
-    """Return the list of AgentSummary objects for a workspace, or None on failure.
-
-    GET /v3/workspaces/{id}/agents returns Resources«AgentSummary»:
-    { _embedded: [ {id, name, ...} ] } - flat list, no pagination.
-    """
     try:
         r = veracode_request("GET", f"/srcclr/v3/workspaces/{workspace_id}/agents", api_id, api_key)
         if r.status_code == 200:
@@ -348,7 +323,6 @@ def list_veracode_agents(workspace_id: str, api_id: str, api_key: str) -> Option
 
 
 def delete_veracode_agent(workspace_id: str, agent_id: str, api_id: str, api_key: str) -> bool:
-    """Delete an agent from a workspace. Returns True on success."""
     try:
         r = veracode_request(
             "DELETE",
@@ -366,13 +340,7 @@ def create_veracode_agent_token(
     api_id: str,
     api_key: str,
 ) -> Optional[str]:
-    """Return an agent access_token for the workspace.
-
-    If an agent with the expected name already exists, regenerate its token via
-    token:regenerate (invalidates old tokens, returns fresh access_token).
-    Otherwise create a new agent - POST /v3/workspaces/{id}/agents returns CreatedAgent
-    which embeds token.access_token directly.
-    """
+    # Regenerates the token if an agent already exists (invalidates old token), otherwise creates one.
     try:
         suffix = "-agt"
         max_org_len = 20 - len(suffix)
@@ -431,10 +399,6 @@ def create_veracode_agent_token(
         print(f"  [ERROR] create_veracode_agent_token: {exc}")
         return None
 
-
-# ---------------------------------------------------------------------------
-# GitHub Actions secrets helpers
-# ---------------------------------------------------------------------------
 
 def get_org_public_key(api_base: str, org: str, token: str) -> Optional[Tuple[str, str]]:
     try:
@@ -509,7 +473,7 @@ def check_veracode_secrets_status(
     org: str,
     github_token: str,
 ) -> Dict[str, str]:
-    """Check which Veracode secrets exist without setting them."""
+    # Read-only check used in dry-run. Returns "exists" or "missing" per secret.
     secret_names = ["VERACODE_API_ID", "VERACODE_API_KEY", "VERACODE_AGENT_TOKEN"]
     results: Dict[str, str] = {}
 
@@ -530,6 +494,7 @@ def set_veracode_secrets(
     veracode_sa_api_key: str,
     veracode_agent_token: str,
 ) -> Tuple[bool, Dict[str, str]]:
+    # Always overwrites all three secrets. Safe to re-run for credential rotation.
     secrets_to_set = {
         "VERACODE_API_ID": veracode_sa_api_id,
         "VERACODE_API_KEY": veracode_sa_api_key,
@@ -538,215 +503,16 @@ def set_veracode_secrets(
     results: Dict[str, str] = {}
 
     for secret_name, secret_value in secrets_to_set.items():
-        if secret_exists(api_base, org, github_token, secret_name):
-            results[secret_name] = "exists"
+        ok = set_org_secret(api_base, org, github_token, secret_name, secret_value)
+        if ok:
+            time.sleep(0.5)
+            verified = secret_exists(api_base, org, github_token, secret_name)
+            results[secret_name] = "set" if verified else "set_unverified"
         else:
-            ok = set_org_secret(api_base, org, github_token, secret_name, secret_value)
-            if ok:
-                time.sleep(0.5)
-                verified = secret_exists(api_base, org, github_token, secret_name)
-                results[secret_name] = "set" if verified else "set_unverified"
-            else:
-                results[secret_name] = "failed"
+            results[secret_name] = "failed"
 
-    all_ok = all(v in ("set", "exists") for v in results.values())
+    all_ok = all(v.startswith("set") for v in results.values())
     return all_ok, results
-
-
-# ---------------------------------------------------------------------------
-# GitHub org discovery
-# ---------------------------------------------------------------------------
-
-def list_orgs_graphql(api_base: str, token: str, enterprise: str) -> Optional[List[str]]:
-    try:
-        graphql_url = (
-            "https://api.github.com/graphql"
-            if "api.github.com" in api_base
-            else f"{api_base.rstrip('/')}/graphql"
-        )
-
-        query = """
-        query($enterprise: String!, $cursor: String) {
-          enterprise(slug: $enterprise) {
-            organizations(first: 100, after: $cursor) {
-              nodes { login }
-              pageInfo { hasNextPage endCursor }
-            }
-          }
-        }
-        """
-
-        all_orgs: List[str] = []
-        cursor: Optional[str] = None
-
-        while True:
-            variables: Dict[str, Any] = {"enterprise": enterprise}
-            if cursor:
-                variables["cursor"] = cursor
-
-            r = request("POST", graphql_url, token, json={"query": query, "variables": variables})
-            if r.status_code != 200:
-                return None
-
-            data = r.json()
-            if "errors" in data or not data.get("data", {}).get("enterprise"):
-                return None
-
-            orgs_data = data["data"]["enterprise"]["organizations"]
-            all_orgs.extend(node["login"] for node in orgs_data.get("nodes", []) if "login" in node)
-
-            page_info = orgs_data.get("pageInfo", {})
-            if not page_info.get("hasNextPage"):
-                break
-            cursor = page_info.get("endCursor")
-
-        return all_orgs or None
-
-    except Exception:
-        return None
-
-
-def list_orgs(
-    api_base: str,
-    token: str,
-    enterprise: Optional[str],
-    orgs_file: Optional[str],
-) -> List[str]:
-    errors: List[str] = []
-
-    if enterprise:
-        print(f'Discovering orgs via enterprise GraphQL: enterprise(slug: "{enterprise}")')
-        try:
-            orgs = list_orgs_graphql(api_base, token, enterprise)
-            if orgs:
-                print(f"[OK] Found {len(orgs)} orgs via GraphQL")
-                return orgs
-            print(f"\n[ERROR] Enterprise GraphQL returned 0 organizations", file=sys.stderr)
-            for line in [
-                f"Enterprise slug '{enterprise}' may be wrong, or token lacks 'read:enterprise' scope.",
-                "Verify: gh auth status",
-                f"Check:  https://github.com/enterprises/{enterprise}",
-                "Retry without --enterprise to see accessible orgs: python script.py --dry-run",
-            ]:
-                print(f"  {line}", file=sys.stderr)
-            raise RuntimeError(f"Enterprise '{enterprise}' returned no organizations")
-        except RuntimeError:
-            raise
-        except requests.exceptions.RequestException as exc:
-            raise RuntimeError(f"Network/API error accessing enterprise: {exc}")
-        except Exception as exc:
-            raise RuntimeError(f"Enterprise API failed: {exc}")
-
-    try:
-        print("Discovering orgs via /user/orgs (all orgs the token user belongs to)")
-        org_objs = paginate_list(f"{api_base}/user/orgs", token, params={"per_page": 100})
-        orgs = [o["login"] for o in org_objs if "login" in o]
-        if orgs:
-            print(f"[OK] Found {len(orgs)} orgs via user API")
-            return orgs
-        errors.append("User API returned no orgs")
-    except Exception as exc:
-        errors.append(f"User API failed: {exc}")
-
-    if orgs_file:
-        try:
-            print(f"Reading orgs from file: {orgs_file}")
-            with open(orgs_file, encoding="utf-8") as f:
-                orgs = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-            if orgs:
-                print(f"[OK] Found {len(orgs)} orgs from file")
-                return orgs
-            errors.append(f"File '{orgs_file}' contains no valid org names")
-        except Exception as exc:
-            errors.append(f"File read failed: {exc}")
-
-    print("\n[ERROR] Unable to determine org list. Tried:", file=sys.stderr)
-    for i, error in enumerate(errors, 1):
-        print(f"   {i}. {error}", file=sys.stderr)
-    print("\nTroubleshooting:", file=sys.stderr)
-    print("  - Ensure GITHUB_TOKEN is set with a valid token", file=sys.stderr)
-    print("  - Verify token has 'read:org' scope", file=sys.stderr)
-    print("  - Provide --enterprise <slug> if using GHEC", file=sys.stderr)
-    print("  - Provide --orgs-file <path> with one org per line", file=sys.stderr)
-    raise RuntimeError("Unable to determine org list. See errors above.")
-
-
-# ---------------------------------------------------------------------------
-# Repository helpers
-# ---------------------------------------------------------------------------
-
-def repo_exists(api_base: str, org: str, repo: str, token: str) -> bool:
-    r = request("GET", f"{api_base}/repos/{org}/{repo}", token)
-    if r.status_code == 200:
-        return True
-    if r.status_code == 404:
-        return False
-    raise RuntimeError(f"{org}/{repo}: repo check failed {r.status_code} {r.text}")
-
-
-def repo_is_empty(api_base: str, org: str, repo: str, token: str) -> bool:
-    try:
-        r = request("GET", f"{api_base}/repos/{org}/{repo}/commits", token, params={"per_page": 1})
-        if r.status_code == 409:
-            return True
-        if r.status_code == 200:
-            return len(r.json()) == 0
-        return False
-    except Exception:
-        return False
-
-
-def create_repo(api_base: str, org: str, repo: str, token: str) -> None:
-    payload = {
-        "name": repo,
-        "private": True,
-        "auto_init": False,
-        "description": "Veracode GitHub Workflow Integration (imported template workflows & config).",
-    }
-    r = request("POST", f"{api_base}/orgs/{org}/repos", token, json=payload)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"{org}/{repo}: repo create failed {r.status_code} {r.text}")
-
-
-def check_main_branch_exists(api_base: str, org: str, repo: str, token: str) -> bool:
-    try:
-        r = request("GET", f"{api_base}/repos/{org}/{repo}/branches/main", token)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-def get_import_status(api_base: str, org: str, repo: str, token: str) -> dict:
-    r = request("GET", f"{api_base}/repos/{org}/{repo}/import", token)
-    if r.status_code == 200:
-        return r.json()
-    raise RuntimeError(f"{org}/{repo}: import status failed {r.status_code} {r.text}")
-
-
-def wait_for_import(
-    api_base: str,
-    org: str,
-    repo: str,
-    token: str,
-    timeout_s: int = 900,
-    poll_s: int = 5,
-) -> dict:
-    deadline = time.time() + timeout_s
-    last: dict = {}
-    while time.time() < deadline:
-        last = get_import_status(api_base, org, repo, token)
-        status = (last.get("status") or "").lower()
-        if status in ("complete", "succeeded"):
-            return last
-        if status in ("failed", "error"):
-            raise RuntimeError(f"{org}/{repo}: import failed: {last}")
-        time.sleep(poll_s)
-    raise RuntimeError(f"{org}/{repo}: import timed out; last={last}")
-
-
-# ---------------------------------------------------------------------------
-# Workflow file injection
-# ---------------------------------------------------------------------------
 
 def _inject_teams_regex(content: str, org: str) -> Tuple[str, bool]:
     pattern = re.compile(
@@ -865,9 +631,266 @@ def inject_veracode_yml(api_base: str, org: str, repo: str, token: str) -> Tuple
         return (True, "created") if r.status_code in (200, 201) else (False, "failed")
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
+def fetch_upstream_veracode_yml() -> Optional[str]:
+    # Fetches veracode.yml directly from the upstream integration repo.
+    url = f"https://raw.githubusercontent.com/{INTEGRATION_SOURCE_URL.removeprefix('https://github.com/').removesuffix('.git')}/main/veracode.yml"
+    try:
+        r = requests.get(url, timeout=30)
+        if r.status_code == 200:
+            return r.text
+        print(f"  [ERROR] Failed to fetch upstream veracode.yml: HTTP {r.status_code}", file=sys.stderr)
+        return None
+    except requests.exceptions.RequestException as exc:
+        print(f"  [ERROR] Failed to fetch upstream veracode.yml: {exc}", file=sys.stderr)
+        return None
+
+
+def update_veracode_yml_in_repo(
+    api_base: str,
+    org: str,
+    repo: str,
+    token: str,
+    yml_content: str,
+) -> Tuple[bool, str]:
+    # Overwrites veracode.yml in the repo, backing up the current file as default-veracode.yml first.
+    # Skips with a warning if the repo is missing or not yet imported.
+    from base64 import b64encode
+
+    if not repo_exists(api_base, org, repo, token):
+        print(f"  [{org}] Skipping veracode.yml update - repo '{repo}' not found")
+        return False, "repo_not_found"
+
+    if repo_is_empty(api_base, org, repo, token):
+        print(f"  [{org}] Skipping veracode.yml update - repo '{repo}' is empty (not yet imported)")
+        return False, "repo_empty"
+
+    veracode_url = f"{api_base}/repos/{org}/{repo}/contents/veracode.yml"
+    default_veracode_url = f"{api_base}/repos/{org}/{repo}/contents/default-veracode.yml"
+
+    r = request("GET", veracode_url, token)
+
+    if r.status_code == 200:
+        original_data = r.json()
+        original_sha = original_data.get("sha")
+        original_content_b64 = original_data.get("content", "")
+
+        # Back up current veracode.yml as default-veracode.yml before overwriting.
+        r_default = request("GET", default_veracode_url, token)
+        backup_payload: Dict[str, Any] = {
+            "message": "Preserve current veracode.yml as default-veracode.yml before update",
+            "content": original_content_b64,
+            "branch": "main",
+        }
+        if r_default.status_code == 200:
+            backup_payload["sha"] = r_default.json().get("sha")
+        request("PUT", default_veracode_url, token, json=backup_payload)
+
+        r_put = request("PUT", veracode_url, token, json={
+            "message": "Update veracode.yml with new configuration",
+            "content": b64encode(yml_content.encode("utf-8")).decode("utf-8"),
+            "branch": "main",
+            "sha": original_sha,
+        })
+        if r_put.status_code in (200, 201):
+            return True, "updated_with_backup"
+        return False, f"put_failed:{r_put.status_code}"
+
+    elif r.status_code == 404:
+        r_put = request("PUT", veracode_url, token, json={
+            "message": "Add veracode.yml configuration",
+            "content": b64encode(yml_content.encode("utf-8")).decode("utf-8"),
+            "branch": "main",
+        })
+        if r_put.status_code in (200, 201):
+            return True, "created"
+        return False, f"put_failed:{r_put.status_code}"
+
+    else:
+        return False, f"get_failed:{r.status_code}"
+
+
+def list_orgs_graphql(api_base: str, token: str, enterprise: str) -> Optional[List[str]]:
+    try:
+        graphql_url = (
+            "https://api.github.com/graphql"
+            if "api.github.com" in api_base
+            else f"{api_base.rstrip('/')}/graphql"
+        )
+
+        query = """
+        query($enterprise: String!, $cursor: String) {
+          enterprise(slug: $enterprise) {
+            organizations(first: 100, after: $cursor) {
+              nodes { login }
+              pageInfo { hasNextPage endCursor }
+            }
+          }
+        }
+        """
+
+        all_orgs: List[str] = []
+        cursor: Optional[str] = None
+
+        while True:
+            variables: Dict[str, Any] = {"enterprise": enterprise}
+            if cursor:
+                variables["cursor"] = cursor
+
+            r = request("POST", graphql_url, token, json={"query": query, "variables": variables})
+            if r.status_code != 200:
+                return None
+
+            data = r.json()
+            if "errors" in data or not data.get("data", {}).get("enterprise"):
+                return None
+
+            orgs_data = data["data"]["enterprise"]["organizations"]
+            all_orgs.extend(node["login"] for node in orgs_data.get("nodes", []) if "login" in node)
+
+            page_info = orgs_data.get("pageInfo", {})
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+
+        return all_orgs or None
+
+    except Exception:
+        return None
+
+
+def list_orgs(
+    api_base: str,
+    token: str,
+    enterprise: Optional[str],
+    orgs_file: Optional[str],
+) -> List[str]:
+    errors: List[str] = []
+
+    if enterprise:
+        print(f'Discovering orgs via enterprise GraphQL: enterprise(slug: "{enterprise}")')
+        try:
+            orgs = list_orgs_graphql(api_base, token, enterprise)
+            if orgs:
+                print(f"[OK] Found {len(orgs)} orgs via GraphQL")
+                return orgs
+            print(f"\n[ERROR] Enterprise GraphQL returned 0 organizations", file=sys.stderr)
+            for line in [
+                f"Enterprise slug '{enterprise}' may be wrong, or token lacks 'read:enterprise' scope.",
+                "Verify: gh auth status",
+                f"Check:  https://github.com/enterprises/{enterprise}",
+                "Retry without --enterprise to see accessible orgs: python script.py --dry-run",
+            ]:
+                print(f"  {line}", file=sys.stderr)
+            raise RuntimeError(f"Enterprise '{enterprise}' returned no organizations")
+        except RuntimeError:
+            raise
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"Network/API error accessing enterprise: {exc}")
+        except Exception as exc:
+            raise RuntimeError(f"Enterprise API failed: {exc}")
+
+    try:
+        print("Discovering orgs via /user/orgs (all orgs the token user belongs to)")
+        org_objs = paginate_list(f"{api_base}/user/orgs", token, params={"per_page": 100})
+        orgs = [o["login"] for o in org_objs if "login" in o]
+        if orgs:
+            print(f"[OK] Found {len(orgs)} orgs via user API")
+            return orgs
+        errors.append("User API returned no orgs")
+    except Exception as exc:
+        errors.append(f"User API failed: {exc}")
+
+    if orgs_file:
+        try:
+            print(f"Reading orgs from file: {orgs_file}")
+            with open(orgs_file, encoding="utf-8") as f:
+                orgs = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+            if orgs:
+                print(f"[OK] Found {len(orgs)} orgs from file")
+                return orgs
+            errors.append(f"File '{orgs_file}' contains no valid org names")
+        except Exception as exc:
+            errors.append(f"File read failed: {exc}")
+
+    print("\n[ERROR] Unable to determine org list. Tried:", file=sys.stderr)
+    for i, error in enumerate(errors, 1):
+        print(f"   {i}. {error}", file=sys.stderr)
+    print("\nTroubleshooting:", file=sys.stderr)
+    print("  - Ensure GITHUB_TOKEN is set with a valid token", file=sys.stderr)
+    print("  - Verify token has 'read:org' scope", file=sys.stderr)
+    print("  - Provide --enterprise <slug> if using GHEC", file=sys.stderr)
+    print("  - Provide --orgs-file <path> with one org per line", file=sys.stderr)
+    raise RuntimeError("Unable to determine org list. See errors above.")
+
+
+def repo_exists(api_base: str, org: str, repo: str, token: str) -> bool:
+    r = request("GET", f"{api_base}/repos/{org}/{repo}", token)
+    if r.status_code == 200:
+        return True
+    if r.status_code == 404:
+        return False
+    raise RuntimeError(f"{org}/{repo}: repo check failed {r.status_code} {r.text}")
+
+
+def repo_is_empty(api_base: str, org: str, repo: str, token: str) -> bool:
+    try:
+        r = request("GET", f"{api_base}/repos/{org}/{repo}/commits", token, params={"per_page": 1})
+        if r.status_code == 409:
+            return True
+        if r.status_code == 200:
+            return len(r.json()) == 0
+        return False
+    except Exception:
+        return False
+
+
+def create_repo(api_base: str, org: str, repo: str, token: str) -> None:
+    payload = {
+        "name": repo,
+        "private": True,
+        "auto_init": False,
+        "description": "Veracode GitHub Workflow Integration (imported template workflows & config).",
+    }
+    r = request("POST", f"{api_base}/orgs/{org}/repos", token, json=payload)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"{org}/{repo}: repo create failed {r.status_code} {r.text}")
+
+
+def check_main_branch_exists(api_base: str, org: str, repo: str, token: str) -> bool:
+    try:
+        r = request("GET", f"{api_base}/repos/{org}/{repo}/branches/main", token)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def get_import_status(api_base: str, org: str, repo: str, token: str) -> dict:
+    r = request("GET", f"{api_base}/repos/{org}/{repo}/import", token)
+    if r.status_code == 200:
+        return r.json()
+    raise RuntimeError(f"{org}/{repo}: import status failed {r.status_code} {r.text}")
+
+
+def wait_for_import(
+    api_base: str,
+    org: str,
+    repo: str,
+    token: str,
+    timeout_s: int = 900,
+    poll_s: int = 5,
+) -> dict:
+    deadline = time.time() + timeout_s
+    last: dict = {}
+    while time.time() < deadline:
+        last = get_import_status(api_base, org, repo, token)
+        status = (last.get("status") or "").lower()
+        if status in ("complete", "succeeded"):
+            return last
+        if status in ("failed", "error"):
+            raise RuntimeError(f"{org}/{repo}: import failed: {last}")
+        time.sleep(poll_s)
+    raise RuntimeError(f"{org}/{repo}: import timed out; last={last}")
+
 
 def ensure_veracode_repo_imported(
     api_base: str,
@@ -977,7 +1000,6 @@ def check_app_installed(
     org: str,
     token: str,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Check if veracode-workflow-app is installed and return a manual install URL if not."""
     inst = find_app_installation(api_base, org, token, APP_SLUG)
     if inst:
         return True, {
@@ -993,10 +1015,6 @@ def check_app_installed(
     }
 
 
-# ---------------------------------------------------------------------------
-# Validation helpers
-# ---------------------------------------------------------------------------
-
 def validate_credentials(
     api_base: str,
     token: str,
@@ -1004,10 +1022,6 @@ def validate_credentials(
     veracode_api_key: Optional[str],
     check_veracode: bool,
 ) -> Tuple[bool, List[str]]:
-    """Validate GitHub and optionally Veracode credentials before processing.
-
-    Returns: (success: bool, errors: List[str])
-    """
     errors: List[str] = []
 
     print("\n[VALIDATION] Checking credentials...")
@@ -1068,10 +1082,6 @@ def validate_credentials(
         return True, []
 
 
-# ---------------------------------------------------------------------------
-# Teams map helpers
-# ---------------------------------------------------------------------------
-
 def load_teams_map(teams_file: str) -> Dict[str, str]:
     teams_map: Dict[str, str] = {}
     try:
@@ -1103,10 +1113,6 @@ def write_orgs_txt(path: Path, orgs: List[str]) -> None:
             f.write(org + "\n")
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Veracode GitHub Workflow Integration rollout helper"
@@ -1127,7 +1133,21 @@ def main() -> None:
                              help="[apply] CSV file (org,teams); orgs with blank teams fall back to org name.")
 
     ap.add_argument("--set-secrets", action="store_true",
-                    help="[apply] Set VERACODE_API_ID, VERACODE_API_KEY, VERACODE_AGENT_TOKEN secrets.")
+                    help="[apply] Set VERACODE_API_ID, VERACODE_API_KEY, VERACODE_AGENT_TOKEN. "
+                         "Always overwrites - safe to re-run for credential rotation.")
+
+    ap.add_argument(
+        "--update-veracode-yml",
+        metavar="FILE",
+        nargs="?",
+        const="",
+        help=(
+            "[apply] Push a veracode.yml to the 'veracode' repo in every org, overwriting the "
+            "current file. Pass a path to use a specific file; omit the path to use veracode.yml "
+            "from the script directory. The current file is backed up as default-veracode.yml "
+            "before overwriting. Orgs with a missing or not-yet-imported repo are skipped."
+        ),
+    )
 
     ap.add_argument("--enterprise", help="GitHub Enterprise slug.")
     ap.add_argument("--orgs-file", help="Path to a file with one org login per line.")
@@ -1173,6 +1193,29 @@ def main() -> None:
     do_apply_repo = bool(args.apply and args.import_repo)
     do_set_secrets = bool(args.apply and args.set_secrets)
     do_set_teams = bool(args.apply and (args.set_teams_auto or args.set_teams_file or args.set_teams_hybrid))
+    do_update_yml = bool(args.apply and args.update_veracode_yml is not None)
+
+    yml_content: Optional[str] = None
+    yml_source_label: Optional[str] = None
+    if do_update_yml:
+        raw_path = args.update_veracode_yml
+        if raw_path:
+            # Explicit local file provided.
+            local_path = Path(raw_path)
+            if not local_path.exists():
+                print(f"ERROR: --update-veracode-yml file not found: {local_path}", file=sys.stderr)
+                sys.exit(1)
+            yml_content = local_path.read_text(encoding="utf-8")
+            yml_source_label = str(local_path.resolve())
+        else:
+            # No path given - fetch veracode.yml from the upstream integration repo.
+            print("[update-veracode-yml] Fetching veracode.yml from upstream integration repo...")
+            yml_content = fetch_upstream_veracode_yml()
+            if not yml_content:
+                print("ERROR: Could not fetch veracode.yml from upstream repo. Pass a local file with --update-veracode-yml FILE.", file=sys.stderr)
+                sys.exit(1)
+            yml_source_label = INTEGRATION_SOURCE_URL
+        print(f"[update-veracode-yml] Source: {yml_source_label}")
 
     veracode_api_id = env("VERACODE_API_ID") if do_set_secrets else None
     veracode_api_key = env("VERACODE_API_KEY") if do_set_secrets else None
@@ -1207,6 +1250,8 @@ def main() -> None:
                 print(f"  Set teams in workflows: YES (from {args.set_teams_file})")
         else:
             print(f"  Set teams in workflows: NO (--set-teams-auto or --set-teams-file or --set-teams-hybrid)")
+        if do_update_yml:
+            print(f"  Update veracode.yml   : YES (source: {yml_source_label})")
         print(f"  Set Veracode secrets  : {'YES' if do_set_secrets else 'NO (--set-secrets)'}")
         if do_set_secrets:
             print(f"    VERACODE_API_ID     : {'SET' if veracode_api_id else 'NOT SET'}  (admin - for API calls)")
@@ -1222,7 +1267,6 @@ def main() -> None:
 
     all_orgs = list_orgs(api_base, token, enterprise, args.orgs_file)
 
-    # When both --enterprise and --orgs-file are given, filter down to the listed orgs only.
     if args.orgs_file and enterprise:
         try:
             with open(args.orgs_file, encoding="utf-8") as f:
@@ -1285,7 +1329,6 @@ def main() -> None:
 
     total_orgs = len(orgs)
 
-    # Skip confirmation on --continue: user already confirmed on the initial run.
     if args.apply and not args.resume:
         print(f"\n{'=' * 60}")
         print(f"   CONFIRMATION REQUIRED")
@@ -1296,8 +1339,10 @@ def main() -> None:
             print(f"  - Create and import veracode repos")
         if do_set_teams:
             print(f"  - Inject teams parameters into workflows")
+        if do_update_yml:
+            print(f"  - Push veracode.yml from {yml_source_label}")
         if do_set_secrets:
-            print(f"  - Set organization secrets")
+            print(f"  - Set/overwrite Veracode org secrets")
         print(f"\nType 'yes' to continue (anything else will cancel): ", end="")
         confirmation = input().strip().lower()
         if confirmation != "yes":
@@ -1322,6 +1367,9 @@ def main() -> None:
         "secrets_all_exist": 0,
         "secrets_partial": 0,
         "secrets_all_missing": 0,
+        "yml_updated": 0,
+        "yml_skipped": 0,
+        "yml_failed": 0,
     }
 
     missing_repo_rows: List[List[str]] = []
@@ -1387,6 +1435,23 @@ def main() -> None:
             stats["app_missing"] += 1
             print(f"[{org}] App check error: {str(exc)[:80]}")
 
+        if do_update_yml:
+            try:
+                yml_ok, yml_action = update_veracode_yml_in_repo(
+                    api_base, org, INTEGRATION_REPO_NAME, token, yml_content
+                )
+                entry["veracode_yml_update"] = {"success": yml_ok, "action": yml_action}
+                if yml_ok:
+                    stats["yml_updated"] += 1
+                elif yml_action in ("repo_not_found", "repo_empty"):
+                    stats["yml_skipped"] += 1
+                else:
+                    stats["yml_failed"] += 1
+            except Exception as exc:
+                entry["veracode_yml_update"] = {"success": False, "action": f"error:{exc}"}
+                stats["yml_failed"] += 1
+                print(f"  [{org}] veracode.yml update error: {str(exc)[:80]}")
+
         if args.dry_run or do_set_secrets:
             try:
                 if args.dry_run:
@@ -1437,6 +1502,7 @@ def main() -> None:
 
         repo_status = "✓" if entry.get("veracode_repo", {}).get("present") else "✗"
         app_status = "✓" if entry.get("workflow_app", {}).get("installed") else "✗"
+
         teams_detail = ""
         if do_set_teams:
             injection = entry.get("veracode_repo", {}).get("teams_injection")
@@ -1444,6 +1510,15 @@ def main() -> None:
                 teams_detail = f" ({injection})" if injection else " (teams_injection_error)"
             else:
                 teams_detail = " (no teams configured)"
+
+        yml_status = ""
+        if do_update_yml:
+            yml_info = entry.get("veracode_yml_update", {})
+            if yml_info.get("success"):
+                yml_status = f"  YML: ✓ ({yml_info.get('action')})"
+            else:
+                yml_status = f"  YML: ✗ ({yml_info.get('action', 'error')})"
+
         secrets_status = ""
         if "secrets" in entry:
             s = entry.get("secrets", {})
@@ -1459,20 +1534,13 @@ def main() -> None:
                 missing_count = sum(1 for v in r.values() if v == "missing")
                 secrets_status = f"  Secrets: ⚠ ({exists_count} exist, {missing_count} missing)"
             elif status == "set":
-                r = s.get("results", {})
-                set_count = sum(1 for v in r.values() if v == "set")
-                exists_count = sum(1 for v in r.values() if v == "exists")
-                if exists_count == 3:
-                    secrets_status = "  Secrets: ✓ (all existed)"
-                elif set_count > 0:
-                    secrets_status = f"  Secrets: ✓ (set {set_count}, existed {exists_count})"
-                else:
-                    secrets_status = "  Secrets: ✓"
+                secrets_status = "  Secrets: ✓"
             elif status == "error":
                 secrets_status = "  Secrets: ✗ (error)"
             else:
                 secrets_status = "  Secrets: ✗"
-        print(f"[{org}] Repo: {repo_status}{teams_detail}  App: {app_status}{secrets_status}")
+
+        print(f"[{org}] Repo: {repo_status}{teams_detail}  App: {app_status}{yml_status}{secrets_status}")
 
         abs_processed = start_index + org_idx
         try:
@@ -1511,6 +1579,10 @@ def main() -> None:
     app_total = stats["app_installed"] + stats["app_missing"]
     if app_total > 0:
         print(f"Workflow App    : {stats['app_installed']} installed, {stats['app_missing']} missing (see manual_install_links.csv)")
+
+    if do_update_yml:
+        yml_total = stats["yml_updated"] + stats["yml_skipped"] + stats["yml_failed"]
+        print(f"veracode.yml    : {stats['yml_updated']} updated, {stats['yml_skipped']} skipped, {stats['yml_failed']} failed (of {yml_total} orgs)")
 
     if args.dry_run and stats["secrets_checked"] > 0:
         print(f"Secrets (check) : {stats['secrets_all_exist']} all exist, "
