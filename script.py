@@ -320,18 +320,6 @@ def list_veracode_agents(workspace_id: str, api_id: str, api_key: str) -> Option
         return None
 
 
-def delete_veracode_agent(workspace_id: str, agent_id: str, api_id: str, api_key: str) -> bool:
-    try:
-        r = veracode_request(
-            "DELETE",
-            f"/srcclr/v3/workspaces/{workspace_id}/agents/{agent_id}",
-            api_id, api_key,
-        )
-        return r.status_code in (200, 204)
-    except Exception:
-        return False
-
-
 def create_veracode_agent_token(
     workspace_id: str,
     org_name: str,
