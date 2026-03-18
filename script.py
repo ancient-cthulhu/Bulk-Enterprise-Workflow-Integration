@@ -217,6 +217,7 @@ def git_mirror_import(
     target_org: str,
     target_repo: str,
     token: str,
+    web_base: str = "https://github.com",
 ) -> Tuple[bool, str]:
     temp_dir: Optional[str] = None
 
@@ -231,7 +232,8 @@ def git_mirror_import(
         if clone_result.returncode != 0:
             return False, f"Clone failed: {clone_result.stderr}"
 
-        target_url = f"https://{token}@github.com/{target_org}/{target_repo}.git"
+        host = web_base.rstrip("/").removeprefix("https://").removeprefix("http://")
+        target_url = f"https://{token}@{host}/{target_org}/{target_repo}.git"
 
         push_result = subprocess.run(
             ["git", "-C", bare_repo, "push", "--mirror", target_url],
@@ -861,6 +863,7 @@ def ensure_veracode_repo_imported(
     do_apply: bool,
     auto_import: bool = False,
     teams_value: Optional[str] = None,
+    web_base: str = "https://github.com",
 ) -> Tuple[bool, Dict[str, Any]]:
     details: Dict[str, Any] = {"repo": INTEGRATION_REPO_NAME}
     exists = repo_exists(api_base, org, INTEGRATION_REPO_NAME, token)
@@ -904,7 +907,7 @@ def ensure_veracode_repo_imported(
             print(f"  [{org}] Git CLI not available - skipping auto import")
             auto_import = False
         else:
-            ok, message = git_mirror_import(INTEGRATION_SOURCE_URL, org, INTEGRATION_REPO_NAME, token)
+            ok, message = git_mirror_import(INTEGRATION_SOURCE_URL, org, INTEGRATION_REPO_NAME, token, web_base)
             if ok:
                 time.sleep(2)
                 if check_main_branch_exists(api_base, org, INTEGRATION_REPO_NAME, token):
@@ -923,7 +926,7 @@ def ensure_veracode_repo_imported(
 
     details["status"] = "repo_created_manual_import_required"
     details["import_instructions"] = {
-        "web_importer_url": f"https://github.com/{org}/{INTEGRATION_REPO_NAME}/import",
+        "web_importer_url": f"{web_base.rstrip('/')}/{org}/{INTEGRATION_REPO_NAME}/import",
         "source_url": INTEGRATION_SOURCE_URL,
         "note": "Manual import required - use GitHub web UI",
     }
@@ -996,9 +999,13 @@ def validate_credentials(
     try:
         r = request("GET", f"{api_base}/user", token)
         if r.status_code == 200:
-            user_data = r.json()
-            username = user_data.get("login", "unknown")
+            username = r.json().get("login", "unknown")
             print(f"  ✓ GitHub token valid (user: {username})")
+            scopes = r.headers.get("X-OAuth-Scopes", "")
+            if scopes:
+                print(f"  ✓ GitHub token scopes: {scopes}")
+            else:
+                print(f"  ⚠ Could not determine GitHub token scopes")
         elif r.status_code == 401:
             errors.append("GitHub token is invalid or expired")
             print(f"  ✗ GitHub token authentication failed")
@@ -1011,17 +1018,6 @@ def validate_credentials(
     except Exception as exc:
         errors.append(f"GitHub API connection failed: {str(exc)[:100]}")
         print(f"  ✗ GitHub API connection error: {str(exc)[:80]}")
-
-    try:
-        r = request("GET", f"{api_base}/user", token)
-        if r.status_code == 200:
-            scopes = r.headers.get("X-OAuth-Scopes", "")
-            if scopes:
-                print(f"  ✓ GitHub token scopes: {scopes}")
-            else:
-                print(f"  ⚠ Could not determine GitHub token scopes")
-    except Exception:
-        pass
 
     if check_veracode and veracode_api_id and veracode_api_key:
         try:
@@ -1110,9 +1106,10 @@ def main() -> None:
         const="",
         help=(
             "[apply] Push a veracode.yml to the 'veracode' repo in every org, overwriting the "
-            "current file. Pass a path to use a specific file; omit the path to use veracode.yml "
-            "from the script directory. The current file is backed up as default-veracode.yml "
-            "before overwriting. Orgs with a missing or not-yet-imported repo are skipped."
+            "current file. Omit FILE to fetch from the upstream integration repo; pass a local "
+            "FILE path to use a custom file instead. The current file is backed up as "
+            "default-veracode.yml before overwriting. Orgs with a missing or not-yet-imported "
+            "repo are skipped."
         ),
     )
 
@@ -1390,6 +1387,7 @@ def main() -> None:
                 do_apply=do_apply_repo,
                 auto_import=do_apply_repo,
                 teams_value=teams_value,
+                web_base=web_base,
             )
             entry["veracode_repo"] = {"present": repo_ok, **repo_details}
             if repo_ok:
