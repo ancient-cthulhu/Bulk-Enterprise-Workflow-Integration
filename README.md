@@ -121,7 +121,7 @@ Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`,
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--enterprise SLUG` | - | GitHub Enterprise slug for org discovery |
-| `--orgs-file FILE` | - | Plain text file, one org per line, `#` for comments |
+| `--orgs-file FILE` | - | Plain text file, one org per line, `#` for comments. Used directly as the org scope when provided alone; used as a filter when combined with `--enterprise`. |
 | `--api-base URL` | `https://api.github.com` | Override for GHES |
 | `--web-base URL` | `https://github.com` | Override for GHES |
 | `--out DIR` | `./out` | Output directory |
@@ -210,9 +210,9 @@ The SCA agent token (`VERACODE_AGENT_TOKEN`) is also rotated as part of this - t
 
 The script resolves orgs in this order:
 
-1. **`--enterprise SLUG`** - GraphQL enterprise API (requires `read:enterprise`)
-2. **No flag** - falls back to `/user/orgs` (all orgs accessible to the token)
-3. **`--orgs-file FILE`** - explicit list, used as filter when combined with `--enterprise`
+1. **`--enterprise SLUG`** - GraphQL enterprise API (requires `read:enterprise`). If `--orgs-file` is also provided, the file is used to filter the enterprise org list down to only the listed orgs.
+2. **`--orgs-file FILE`** - explicit list used directly as the org scope, one org per line.
+3. **No flags** - falls back to `/user/orgs` (all orgs accessible to the token).
 
 ---
 
