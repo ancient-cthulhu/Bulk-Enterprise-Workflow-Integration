@@ -971,41 +971,13 @@ def manual_install_url(web_base: str, org: str, org_id: Optional[int] = None) ->
     return f"{web_base}/apps/{APP_SLUG}/installations/new"
 
 
-def enterprise_install(
-    api_base: str,
-    enterprise: str,
-    org: str,
-    token: str,
-    client_id: str,
-) -> Tuple[bool, Dict[str, Any]]:
-    url = f"{api_base}/enterprises/{enterprise}/apps/organizations/{org}/installations"
-    payload: Dict[str, Any] = {"client_id": client_id, "repository_selection": "all"}
-    r = request("POST", url, token, json=payload)
-    res: Dict[str, Any] = {
-        "endpoint": url,
-        "http_status": r.status_code,
-        "response_snippet": r.text[:500] if r.text else "",
-    }
-    if r.status_code in (200, 201):
-        res["result"] = "installed"
-        return True, res
-    if r.status_code in (403, 404):
-        res["result"] = "blocked"
-        return False, res
-    res["result"] = "error"
-    return False, res
-
-
-def ensure_app_installed(
+def check_app_installed(
     api_base: str,
     web_base: str,
     org: str,
     token: str,
-    do_apply: bool,
-    allow_install_attempt: bool,
-    enterprise: Optional[str],
-    client_id: Optional[str],
 ) -> Tuple[bool, Dict[str, Any]]:
+    """Check if veracode-workflow-app is installed and return a manual install URL if not."""
     inst = find_app_installation(api_base, org, token, APP_SLUG)
     if inst:
         return True, {
@@ -1014,32 +986,11 @@ def ensure_app_installed(
             "repository_selection": inst.get("repository_selection"),
         }
 
-    details: Dict[str, Any] = {"status": "missing"}
     org_id = get_org_id(api_base, org, token)
-
-    if not do_apply or not allow_install_attempt or not enterprise or not client_id:
-        details["next"] = "manual_install"
-        details["install_url"] = manual_install_url(web_base, org, org_id)
-        details["reason"] = "manual_install_required"
-        return False, details
-
-    _ok, attempt = enterprise_install(api_base, enterprise, org, token, client_id)
-    details["automation_attempt"] = attempt
-
-    time.sleep(0.5)
-    inst2 = find_app_installation(api_base, org, token, APP_SLUG)
-    if inst2:
-        return True, {
-            "status": "installed_after_attempt",
-            "installation_id": inst2.get("id"),
-            "repository_selection": inst2.get("repository_selection"),
-            "attempt": attempt,
-        }
-
-    details["next"] = "manual_install"
-    details["install_url"] = manual_install_url(web_base, org, org_id)
-    details["reason"] = "auto_install_blocked"
-    return False, details
+    return False, {
+        "status": "missing",
+        "install_url": manual_install_url(web_base, org, org_id),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1061,7 +1012,6 @@ def validate_credentials(
 
     print("\n[VALIDATION] Checking credentials...")
 
-    # Test GitHub token
     try:
         r = request("GET", f"{api_base}/user", token)
         if r.status_code == 200:
@@ -1081,7 +1031,6 @@ def validate_credentials(
         errors.append(f"GitHub API connection failed: {str(exc)[:100]}")
         print(f"  ✗ GitHub API connection error: {str(exc)[:80]}")
 
-    # Report GitHub token scopes if available
     try:
         r = request("GET", f"{api_base}/user", token)
         if r.status_code == 200:
@@ -1093,7 +1042,6 @@ def validate_credentials(
     except Exception:
         pass
 
-    # Test Veracode credentials if required
     if check_veracode and veracode_api_id and veracode_api_key:
         try:
             r = veracode_request("GET", "/srcclr/v3/workspaces", veracode_api_id, veracode_api_key, params={"size": 1, "page": 0})
@@ -1178,13 +1126,10 @@ def main() -> None:
     teams_group.add_argument("--set-teams-hybrid", metavar="FILE",
                              help="[apply] CSV file (org,teams); orgs with blank teams fall back to org name.")
 
-    ap.add_argument("--install-app", action="store_true",
-                    help="[apply] Attempt enterprise installation of the Veracode Workflow App.")
     ap.add_argument("--set-secrets", action="store_true",
                     help="[apply] Set VERACODE_API_ID, VERACODE_API_KEY, VERACODE_AGENT_TOKEN secrets.")
 
     ap.add_argument("--enterprise", help="GitHub Enterprise slug.")
-    ap.add_argument("--app-client-id", help="GitHub App client ID (required for --install-app).")
     ap.add_argument("--orgs-file", help="Path to a file with one org login per line.")
     ap.add_argument("--out", default="out", help="Output directory (default: ./out).")
 
@@ -1224,10 +1169,8 @@ def main() -> None:
     api_base: str = args.api_base.rstrip("/")
     web_base: str = args.web_base.rstrip("/")
     enterprise: Optional[str] = args.enterprise
-    client_id: Optional[str] = args.app_client_id
 
     do_apply_repo = bool(args.apply and args.import_repo)
-    do_apply_app = bool(args.apply and args.install_app)
     do_set_secrets = bool(args.apply and args.set_secrets)
     do_set_teams = bool(args.apply and (args.set_teams_auto or args.set_teams_file or args.set_teams_hybrid))
 
@@ -1264,11 +1207,7 @@ def main() -> None:
                 print(f"  Set teams in workflows: YES (from {args.set_teams_file})")
         else:
             print(f"  Set teams in workflows: NO (--set-teams-auto or --set-teams-file or --set-teams-hybrid)")
-        print(f"  Install missing apps  : {'YES' if do_apply_app else 'NO (--install-app)'}")
         print(f"  Set Veracode secrets  : {'YES' if do_set_secrets else 'NO (--set-secrets)'}")
-        if do_apply_app:
-            print(f"    Enterprise   : {enterprise or 'NOT SET (required for app install)'}")
-            print(f"    App Client ID: {client_id or 'NOT SET (required for app install)'}")
         if do_set_secrets:
             print(f"    VERACODE_API_ID     : {'SET' if veracode_api_id else 'NOT SET'}  (admin - for API calls)")
             print(f"    VERACODE_API_KEY    : {'SET' if veracode_api_key else 'NOT SET'}  (admin - for API calls)")
@@ -1306,7 +1245,6 @@ def main() -> None:
     if args.dry_run or not teams_map_csv_path.exists():
         write_teams_map_csv(teams_map_csv_path, orgs)
 
-    # Validate credentials before processing
     validation_ok, validation_errors = validate_credentials(
         api_base=api_base,
         token=token,
@@ -1358,8 +1296,6 @@ def main() -> None:
             print(f"  - Create and import veracode repos")
         if do_set_teams:
             print(f"  - Inject teams parameters into workflows")
-        if do_apply_app:
-            print(f"  - Install Veracode Workflow App")
         if do_set_secrets:
             print(f"  - Set organization secrets")
         print(f"\nType 'yes' to continue (anything else will cancel): ", end="")
@@ -1378,8 +1314,8 @@ def main() -> None:
         "processed": 0,
         "repo_success": 0,
         "repo_fail": 0,
-        "app_success": 0,
-        "app_fail": 0,
+        "app_installed": 0,
+        "app_missing": 0,
         "secrets_success": 0,
         "secrets_fail": 0,
         "secrets_checked": 0,
@@ -1397,13 +1333,10 @@ def main() -> None:
         print(f"\n[{org_idx}/{total_orgs} ({progress_pct:.1f}%)] Processing: {org}")
 
         now = datetime.now()
-        timestamp_iso = now.isoformat()
-        timestamp_readable = now.strftime("%Y-%m-%d %H:%M:%S %A")
-
         entry: Dict[str, Any] = {
             "org": org,
-            "timestamp": timestamp_iso,
-            "timestamp_readable": timestamp_readable
+            "timestamp": now.isoformat(),
+            "timestamp_readable": now.strftime("%Y-%m-%d %H:%M:%S %A"),
         }
 
         stats["processed"] += 1
@@ -1440,24 +1373,19 @@ def main() -> None:
             print(f"[{org}] Repo error: {str(exc)[:80]}")
 
         try:
-            app_ok, app_details = ensure_app_installed(
-                api_base=api_base, web_base=web_base, org=org, token=token,
-                do_apply=args.apply, allow_install_attempt=do_apply_app,
-                enterprise=enterprise, client_id=client_id,
-            )
+            app_ok, app_details = check_app_installed(api_base, web_base, org, token)
             entry["workflow_app"] = {"installed": app_ok, **app_details}
             if app_ok:
-                stats["app_success"] += 1
+                stats["app_installed"] += 1
             else:
-                stats["app_fail"] += 1
-                missing_app_rows.append([org, APP_SLUG, app_details.get("reason", "missing")])
-                if app_details.get("install_url"):
-                    manual_links_rows.append([org, app_details["install_url"], app_details.get("reason", "")])
+                stats["app_missing"] += 1
+                missing_app_rows.append([org, APP_SLUG, "missing"])
+                manual_links_rows.append([org, app_details["install_url"], "manual_install_required"])
         except Exception as exc:
             entry["workflow_app"] = {"installed": None, "status": "error", "error": str(exc)}
             missing_app_rows.append([org, APP_SLUG, f"error:{exc}"])
-            stats["app_fail"] += 1
-            print(f"[{org}] App error: {str(exc)[:80]}")
+            stats["app_missing"] += 1
+            print(f"[{org}] App check error: {str(exc)[:80]}")
 
         if args.dry_run or do_set_secrets:
             try:
@@ -1580,10 +1508,9 @@ def main() -> None:
         repo_pct = (stats["repo_success"] / repo_total * 100) if repo_total > 0 else 0
         print(f"Veracode Repos  : {stats['repo_success']} success, {stats['repo_fail']} failed ({repo_pct:.1f}% success)")
 
-    if stats["app_success"] > 0 or stats["app_fail"] > 0:
-        app_total = stats["app_success"] + stats["app_fail"]
-        app_pct = (stats["app_success"] / app_total * 100) if app_total > 0 else 0
-        print(f"Workflow Apps   : {stats['app_success']} success, {stats['app_fail']} failed ({app_pct:.1f}% success)")
+    app_total = stats["app_installed"] + stats["app_missing"]
+    if app_total > 0:
+        print(f"Workflow App    : {stats['app_installed']} installed, {stats['app_missing']} missing (see manual_install_links.csv)")
 
     if args.dry_run and stats["secrets_checked"] > 0:
         print(f"Secrets (check) : {stats['secrets_all_exist']} all exist, "
@@ -1606,7 +1533,7 @@ def main() -> None:
     print(" - manual_install_links.csv")
 
     if missing_repo_rows or missing_app_rows:
-        print(f"\n  Note: {len(missing_repo_rows)} org(s) have missing repos, {len(missing_app_rows)} org(s) have missing apps")
+        print(f"\n  Note: {len(missing_repo_rows)} org(s) have missing repos, {len(missing_app_rows)} org(s) need app installation")
         print(f"    See CSV files above for details and actions needed.")
 
     sys.exit(0)
