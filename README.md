@@ -1,6 +1,6 @@
 # Veracode Bulk GitHub Workflow Integration
 
-Deploys Veracode security scanning across GitHub Enterprise organizations at scale. Handles repository creation, workflow configuration, team assignments, app installation, and secrets management with audit trails and checkpoint/resume support.
+Deploys Veracode security scanning across GitHub Enterprise organizations at scale. Handles repository creation, workflow configuration, team assignments, app installation, and secrets management with audit trails, checkpoint/resume support, and parallel execution.
 
 ---
 
@@ -13,7 +13,7 @@ For each organization, the script can:
 3. Inject `teams:` parameter into workflow files
 4. Create a Veracode SCA workspace, generate a unique agent token, and set GitHub Actions secrets
 
-All operations are idempotent - safe to re-run. If a repo import completes after the script times out, the next run detects the incomplete state via the absence of `default-veracode.yml` and automatically applies the missing post-import steps.
+All operations are idempotent, safe to re-run. If a repo import completes after the script times out, the next run detects the incomplete state via the absence of `default-veracode.yml` and automatically applies the missing post-import steps.
 
 > **App installation is manual.** The script checks whether `veracode-workflow-app` is installed per org and generates `manual_install_links.csv` with a direct install URL for each org that needs it. Automated installation via the GitHub API is not supported for third-party apps.
 
@@ -127,6 +127,7 @@ Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`,
 | `--out DIR` | `./out` | Output directory |
 | `--skip-to ORG` | - | Skip all orgs before this one |
 | `--continue` | - | Resume from last checkpoint |
+| `--workers N` | `1` | Number of parallel worker threads. See [Parallel Execution](#parallel-execution). |
 
 ---
 
@@ -148,7 +149,7 @@ Three modes are available:
 
 `teams_map.csv` is generated automatically on every dry-run. Fill in the `teams` column (comma-separated names accepted) and pass it back on apply. Files that already have `teams:` are left unchanged.
 
-The teams map is a lookup table, not a scope filter. Only orgs that are being processed (determined by `--enterprise`, `--orgs-file`, or `/user/orgs`) will be touched. If your orgs file has 1 org and your teams map has 100 entries, only the 1 org gets processed - using its matching entry from the map if one exists.
+The teams map is a lookup table, not a scope filter. Only orgs that are being processed (determined by `--enterprise`, `--orgs-file`, or `/user/orgs`) will be touched. If your orgs file has 1 org and your teams map has 100 entries, only the 1 org gets processed using its matching entry from the map if one exists.
 
 ---
 
@@ -172,7 +173,7 @@ Once onboarding is complete, re-enable gating by setting `break_build_policy_fin
 
 ### Bulk veracode.yml Update
 
-To push a new `veracode.yml` to all orgs after initial onboarding - for example to update the policy name, change scan triggers, or enable build gating across the fleet:
+To push a new `veracode.yml` to all orgs after initial onboarding, for example to update the policy name, change scan triggers, or enable build gating across the fleet:
 
 ```bash
 # Fetch veracode.yml from the upstream integration repo (default)
@@ -308,9 +309,57 @@ python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secret
 python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secrets --continue
 ```
 
-Checkpoint state is saved to `out/checkpoint.json` at the start of each org. If the script is interrupted mid-org, `--continue` restarts from that org so nothing is skipped. All operations are idempotent so re-running a completed org is safe. The `--continue` flag also skips the confirmation prompt - confirmation was already given on the initial run.
+Checkpoint state is saved to `out/checkpoint.json` after each org completes. If the script is interrupted mid-org, `--continue` restarts from that org so nothing is skipped. All operations are idempotent so re-running a completed org is safe. The `--continue` flag also skips the confirmation prompt - confirmation was already given on the initial run.
 
 Use `--skip-to ORG` to jump to a specific org without needing a checkpoint file.
+
+For large enterprises, combine `--workers` with `--continue` to maximize throughput with crash recovery. See [Parallel Execution](#parallel-execution).
+
+---
+
+## Parallel Execution
+
+By default the script processes one org at a time. Use `--workers N` to process multiple orgs concurrently using a thread pool. All API calls are I/O-bound, so threading provides real throughput gains with no additional processes or dependencies.
+
+```bash
+# Dry-run across 200 orgs using 5 parallel workers
+python script.py --dry-run --enterprise YOUR-ENTERPRISE --workers 5
+
+# Apply with 5 workers - fastest safe setting for most token budgets
+python script.py --apply --enterprise YOUR-ENTERPRISE \
+  --import-repo --set-secrets --workers 5
+```
+
+### Choosing a worker count
+
+| Workers | Use case |
+|---------|----------|
+| `1` | Default. Sequential. Easiest to read logs. |
+| `3` | Safe starting point for most deployments. |
+| `5` | Recommended for large enterprises (100+ orgs). |
+| `10` | Maximum recommended. Approaches rate limit risk at peak. |
+
+GitHub's authenticated API rate limit is 5,000 requests per hour per token. Each org in a full apply run (`--import-repo --set-teams-auto --set-secrets`) consumes roughly 15-20 API calls. At 5 workers processing ~10 orgs/min, a 200-org run stays well within the hourly limit. If the limit is approached, the script automatically pauses all workers until the window resets.
+
+### Rate limit behavior with parallel workers
+
+All workers share a single global rate limit state. When any worker receives a near-limit signal (`X-RateLimit-Remaining < 10`), it sets a shared resume timestamp and sleeps. Other workers check the shared timestamp before each request and wait if a pause is active. This prevents mass restarts once the window resets.
+
+### Checkpoint compatibility
+
+`--workers` is fully compatible with `--continue`. The checkpoint file records all completed orgs as a list alongside the latest processed org. On resume, the org list is replayed from the checkpoint position regardless of the order workers originally completed them.
+
+```bash
+# Initial parallel run
+python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secrets --workers 5
+
+# Resume after interruption, keeping the same worker count
+python script.py --apply --enterprise YOUR-ENTERPRISE --import-repo --set-secrets --workers 5 --continue
+```
+
+### Log output with multiple workers
+
+Per-org log lines are printed atomically but may arrive out of order relative to the org list (this is expected). The `[N/TOTAL]` progress prefix on each line shows the submission order. The audit report always contains one entry per org regardless of completion order.
 
 ---
 
