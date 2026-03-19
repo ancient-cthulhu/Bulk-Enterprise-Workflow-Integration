@@ -98,6 +98,7 @@ class RunContext:
     yml_content: str | None             # content for --update-veracode-yml
     onboarding_yml_content: str | None  # content for --import-repo post-steps
     teams_map: dict[str, str]
+    team_prefix: str
     veracode_api_id: str | None
     veracode_api_key: str | None
     veracode_sa_api_id: str | None
@@ -1318,6 +1319,8 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
             teams_value = ctx.teams_map.get(org, "").strip() or org
         else:
             teams_value = ctx.teams_map.get(org, "").strip() or None
+        if teams_value and ctx.team_prefix:
+            teams_value = ctx.team_prefix + teams_value
     else:
         teams_value = None
 
@@ -1543,6 +1546,11 @@ def main() -> None:
     teams_group.add_argument("--set-teams-hybrid", metavar="FILE",
                              help="[apply] CSV file (org,teams); orgs with blank teams fall back to org name.")
 
+    ap.add_argument("--team-prefix", default="", metavar="PREFIX",
+                    help="[apply] Prepend PREFIX to every injected teams value. "
+                         "Applied after --set-teams-auto/file/hybrid resolution. "
+                         "Example: --team-prefix 'gh-' turns 'acme-dev' into 'gh-acme-dev'.")
+
     ap.add_argument("--set-secrets", action="store_true",
                     help="[apply] Set VERACODE_API_ID, VERACODE_API_KEY, VERACODE_AGENT_TOKEN. "
                          "Always overwrites - safe to re-run for credential rotation.")
@@ -1688,6 +1696,8 @@ def main() -> None:
                 print(f"  Set teams in workflows: YES (hybrid - from {args.set_teams_hybrid}, org name fallback)")
             else:
                 print(f"  Set teams in workflows: YES (from {args.set_teams_file})")
+            if args.team_prefix:
+                print(f"    Team prefix         : '{args.team_prefix}'")
         else:
             print("  Set teams in workflows: NO (--set-teams-auto or --set-teams-file or --set-teams-hybrid)")
         if do_update_yml:
@@ -1814,6 +1824,7 @@ def main() -> None:
         yml_content=yml_content,
         onboarding_yml_content=onboarding_yml_content,
         teams_map=teams_map,
+        team_prefix=args.team_prefix,
         veracode_api_id=veracode_api_id,
         veracode_api_key=veracode_api_key,
         veracode_sa_api_id=veracode_sa_api_id,

@@ -113,6 +113,7 @@ Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`,
 | `--set-teams-auto` | Inject `teams: "<org-name>"` for every org |
 | `--set-teams-file FILE` | Inject per-org team values from `teams_map.csv`. Blank rows are skipped. |
 | `--set-teams-hybrid FILE` | Same as `--set-teams-file` but blank rows fall back to the org name |
+| `--team-prefix PREFIX` | Prepend `PREFIX` to every resolved teams value. Applied after `--set-teams-auto/file/hybrid`. Example: `--team-prefix "gh-"` turns `acme-dev` into `gh-acme-dev`. Orgs with no resolved teams value (blank file row on the  `--set-teams-file FILE` option) are not affected. |
 | `--set-secrets` | Set `VERACODE_API_ID`, `VERACODE_API_KEY`, `VERACODE_AGENT_TOKEN` per org. Always overwrites all three - safe to re-run for annual credential rotation. The SCA agent token is regenerated via `token:regenerate` on each run, invalidating the previous one. |
 | `--update-veracode-yml [FILE]` | Push a `veracode.yml` to the `veracode` repo in every org. By default fetches `veracode.yml` directly from the upstream integration repo (`github.com/veracode/github-actions-integration`). Pass a local `FILE` path to use a custom file instead. The current file is backed up as `default-veracode.yml` first. Orgs with a missing or not-yet-imported repo are skipped with a warning. |
 
@@ -146,6 +147,18 @@ Three modes are available:
 - **`--set-teams-auto`** - uses the org name for every org, no configuration needed
 - **`--set-teams-file`** - reads from `teams_map.csv`, skips blank rows
 - **`--set-teams-hybrid`** - reads from `teams_map.csv`, falls back to org name for blank rows
+
+Use `--team-prefix PREFIX` with any mode to prepend a fixed string to every resolved value. The prefix is applied after mode resolution, so it works identically across all three modes. Orgs that produce no teams value (blank row in file mode) are skipped and the prefix is not applied to them.
+
+```bash
+# Results in teams: "gh-acme-dev"
+python script.py --apply --enterprise YOUR-ENTERPRISE \
+  --set-teams-auto --team-prefix "gh-"
+
+# Results in teams: "security-<value-from-csv>"
+python script.py --apply --enterprise YOUR-ENTERPRISE \
+  --set-teams-file out/teams_map.csv --team-prefix "security-"
+```
 
 `teams_map.csv` is generated automatically on every dry-run. Fill in the `teams` column (comma-separated names accepted) and pass it back on apply. Files that already have `teams:` are left unchanged.
 
