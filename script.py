@@ -52,6 +52,109 @@ _rate_limit_pause_until: float = 0.0
 
 
 # ---------------------------------------------------------------------------
+# Per-org output buffer
+# ---------------------------------------------------------------------------
+
+class OrgBuffer:
+    """Collects log lines for one org and flushes them atomically to stdout.
+
+    In sequential mode (workers == 1) flush_on_add=True streams lines
+    immediately, preserving the original behaviour. In parallel mode
+    flush_on_add=False buffers everything until flush() is called at the
+    end of process_org, so output for one org always appears as a single
+    contiguous block.
+    """
+
+    def __init__(self, org: str, org_idx: int, total_orgs: int, flush_on_add: bool = False) -> None:
+        self.org = org
+        self.org_idx = org_idx
+        self.total_orgs = total_orgs
+        self.flush_on_add = flush_on_add
+        self._lines: list[str] = []
+
+    def add(self, msg: str) -> None:
+        if self.flush_on_add:
+            with _print_lock:
+                print(msg, flush=True)
+        else:
+            self._lines.append(msg)
+
+    def flush(self) -> None:
+        """Print all buffered lines atomically. No-op in flush_on_add mode."""
+        if self.flush_on_add or not self._lines:
+            return
+        pct = (self.org_idx / self.total_orgs * 100) if self.total_orgs else 100.0
+        header = f"\n[{self.org_idx}/{self.total_orgs} ({pct:.1f}%)] {self.org}"
+        block = "\n".join([header] + self._lines)
+        try:
+            with _print_lock:
+                print(block, flush=True)
+        finally:
+            self._lines.clear()
+
+
+# ---------------------------------------------------------------------------
+# Live progress display for parallel mode
+# ---------------------------------------------------------------------------
+
+class ProgressDisplay:
+    """Maintains a live N-line worker status block at the bottom of the terminal.
+
+    Uses ANSI escape codes to redraw in place. Automatically disabled when
+    stdout is not a TTY (CI, redirected output) so it degrades safely.
+
+    The display is owned by the main thread. Workers call update() and
+    clear_slot() which are thread-safe via an internal lock.
+    """
+
+    def __init__(self, workers: int) -> None:
+        self._workers = workers
+        self._slots: dict[int, str] = {}
+        self._lock = threading.Lock()
+        self._active = sys.stdout.isatty() and workers > 1
+        if self._active:
+            print("\n" * workers, end="", flush=True)
+
+    def _redraw(self) -> None:
+        """Redraw all worker slot lines in place. Must be called under self._lock."""
+        if not self._active:
+            return
+        # Move cursor up by workers lines, redraw each slot line
+        lines = []
+        for i in range(self._workers):
+            lines.append(self._slots.get(i, ""))
+        # Move up N lines then overwrite
+        up = f"\x1b[{self._workers}A"
+        body = "\n".join(f"\x1b[2K{line}" for line in lines)
+        sys.stdout.write(up + body + "\n")
+        sys.stdout.flush()
+
+    def update(self, slot_id: int, org: str, elapsed: float) -> None:
+        """Set the status line for a worker slot."""
+        if not self._active:
+            return
+        with self._lock:
+            self._slots[slot_id] = f"  [worker {slot_id + 1}] {org} ... {elapsed:.0f}s"
+            self._redraw()
+
+    def clear_slot(self, slot_id: int) -> None:
+        """Clear a worker slot when its org completes."""
+        if not self._active:
+            return
+        with self._lock:
+            self._slots.pop(slot_id, None)
+            self._redraw()
+
+    def stop(self) -> None:
+        """Clear all slots and move cursor past the display area."""
+        if not self._active:
+            return
+        with self._lock:
+            self._slots.clear()
+            self._redraw()
+
+
+# ---------------------------------------------------------------------------
 # Typed stats container
 # ---------------------------------------------------------------------------
 
@@ -1300,9 +1403,23 @@ def load_teams_map(teams_file: str) -> dict[str, str]:
 # Per-org processing
 # ---------------------------------------------------------------------------
 
-def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str | None = None) -> None:
+def process_org(
+    org: str,
+    org_idx: int,
+    ctx: RunContext,
+    cached_clone_dir: str | None = None,
+    buf: OrgBuffer | None = None,
+) -> None:
+    # In sequential mode buf is None - create a flush_on_add buffer so behaviour
+    # is identical to before (lines stream immediately via tprint).
+    if buf is None:
+        buf = OrgBuffer(org, org_idx, ctx.total_orgs, flush_on_add=True)
+
     progress_pct = (org_idx / ctx.total_orgs) * 100 if ctx.total_orgs else 100.0
-    tprint(f"\n[{org_idx}/{ctx.total_orgs} ({progress_pct:.1f}%)] Processing: {org}")
+    # Sequential mode: print the header line immediately as before.
+    # Parallel mode: header is prepended by OrgBuffer.flush().
+    if buf.flush_on_add:
+        buf.add(f"\n[{org_idx}/{ctx.total_orgs} ({progress_pct:.1f}%)] Processing: {org}")
 
     now = datetime.now()
     entry: dict[str, Any] = {
@@ -1352,7 +1469,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
             ctx.missing_repo_rows.append([org, INTEGRATION_REPO_NAME, f"error:{exc}"])
         with ctx.stats_lock:
             ctx.stats.repo_fail += 1
-        tprint(f"[{org}] Repo error: {str(exc)[:80]}")
+        buf.add(f"  Repo error: {str(exc)[:80]}")
 
     # --- App install check ----------------------------------------------------
     try:
@@ -1373,7 +1490,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
             ctx.missing_app_rows.append([org, APP_SLUG, f"error:{exc}"])
         with ctx.stats_lock:
             ctx.stats.app_missing += 1
-        tprint(f"[{org}] App check error: {str(exc)[:80]}")
+        buf.add(f"  App check error: {str(exc)[:80]}")
 
     # --- veracode.yml update --------------------------------------------------
     if ctx.do_update_yml and ctx.yml_content:
@@ -1394,7 +1511,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
             entry["veracode_yml_update"] = {"success": False, "action": f"error:{exc}"}
             with ctx.stats_lock:
                 ctx.stats.yml_failed += 1
-            tprint(f"  [{org}] veracode.yml update error: {str(exc)[:80]}")
+            buf.add(f"  veracode.yml update error: {str(exc)[:80]}")
 
     # --- Secrets --------------------------------------------------------------
     if ctx.dry_run or ctx.do_set_secrets:
@@ -1453,7 +1570,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
                 ctx.stats.secrets_fail += 1
                 if ctx.dry_run:
                     ctx.stats.secrets_checked += 1
-            tprint(f"[{org}] Secrets error: {str(exc)[:80]}")
+            buf.add(f"  Secrets error: {str(exc)[:80]}")
 
     # --- Write report + checkpoint (checkpoint saved AFTER all work completes) ---
     with ctx.report_lock:
@@ -1481,7 +1598,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
                 newline="\n",
             )
         except Exception as exc:
-            tprint(f"  [WARNING] Failed to save checkpoint: {exc}")
+            buf.add(f"  [WARNING] Failed to save checkpoint: {exc}")
 
     # --- Console summary line -------------------------------------------------
     repo_status = "✓" if entry.get("veracode_repo", {}).get("present") else "✗"
@@ -1522,7 +1639,8 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
         else:
             secrets_status = "  Secrets: ✗"
 
-    tprint(f"[{org}] Repo: {repo_status}{teams_detail}  App: {app_status}{yml_status}{secrets_status}")
+    buf.add(f"  Repo: {repo_status}{teams_detail}  App: {app_status}{yml_status}{secrets_status}")
+    buf.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -1852,17 +1970,51 @@ def main() -> None:
     try:
         if workers > 1:
             print(f"[PARALLEL] Running with {workers} workers\n")
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {
-                    executor.submit(process_org, org, idx, ctx, _cached_clone_dir): org
-                    for idx, org in enumerate(orgs, 1)
-                }
-                for future in as_completed(futures):
-                    org_name = futures[future]
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        tprint(f"[ERROR] Unhandled exception for org {org_name}: {exc}")
+            progress = ProgressDisplay(workers)
+
+            _ticker_stop = threading.Event()
+            _active_slots: dict[int, tuple[str, float]] = {}
+            _active_lock = threading.Lock()
+
+            def _ticker() -> None:
+                while not _ticker_stop.is_set():
+                    time.sleep(2)
+                    with _active_lock:
+                        snapshot = list(_active_slots.items())
+                    for sid, (o, t0) in snapshot:
+                        progress.update(sid, o, time.time() - t0)
+
+            ticker_thread = threading.Thread(target=_ticker, daemon=True)
+            ticker_thread.start()
+
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    # Submit all futures upfront. The executor queues them and runs
+                    # at most max_workers concurrently. Slot IDs are assigned via
+                    # modulo so each display line is reused across orgs without a pool.
+                    all_futures: dict[Any, tuple[str, int, OrgBuffer]] = {}
+                    for idx, org in enumerate(orgs, 1):
+                        slot_id = (idx - 1) % workers
+                        org_buf = OrgBuffer(org, idx, total_orgs, flush_on_add=False)
+                        with _active_lock:
+                            _active_slots[slot_id] = (org, time.time())
+                        progress.update(slot_id, org, 0)
+                        f = executor.submit(process_org, org, idx, ctx, _cached_clone_dir, org_buf)
+                        all_futures[f] = (org, slot_id, org_buf)
+
+                    for future in as_completed(all_futures):
+                        org_name, slot_id, _ = all_futures[future]
+                        with _active_lock:
+                            _active_slots.pop(slot_id, None)
+                        progress.clear_slot(slot_id)
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            tprint(f"[ERROR] Unhandled exception for org {org_name}: {exc}")
+            finally:
+                _ticker_stop.set()
+                ticker_thread.join(timeout=3)
+                progress.stop()
         else:
             for idx, org in enumerate(orgs, 1):
                 process_org(org, idx, ctx, _cached_clone_dir)
