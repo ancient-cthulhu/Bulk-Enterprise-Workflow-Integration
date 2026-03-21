@@ -93,11 +93,7 @@ class OrgBuffer:
             self._lines.clear()
 
     def flush_then_clear(self, progress: "ProgressDisplay", slot_id: int) -> None:
-        """Flush buffered output and clear the progress slot in one _print_lock acquisition.
-
-        This prevents any other stdout write (ticker, another flush) from interleaving
-        between the org's log block and the slot erasure.
-        """
+        """Flush buffered output and clear the progress slot atomically."""
         if self.flush_on_add:
             return
         pct = (self.org_idx / self.total_orgs * 100) if self.total_orgs else 100.0
@@ -106,80 +102,47 @@ class OrgBuffer:
         try:
             with _print_lock:
                 print(block, flush=True)
-                if progress._active:
-                    progress._slots.pop(slot_id, None)
-                    progress._redraw_unlocked()
         finally:
             self._lines.clear()
+            progress.clear_slot(slot_id)
 
 
 # ---------------------------------------------------------------------------
 # Live progress display for parallel mode
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Live progress display for parallel mode
+# ---------------------------------------------------------------------------
+
 class ProgressDisplay:
-    """Maintains a live N-line worker status block at the bottom of the terminal.
+    """Prints a single status line to stdout when a worker starts an org.
 
-    Uses ANSI escape codes to redraw in place. Automatically disabled when
-    stdout is not a TTY (CI, redirected output) so it degrades safely.
-
-    All stdout writes go through the module-level _print_lock so they are
-    fully serialized with OrgBuffer.flush() - no separate internal lock needed.
+    No ticker, no redraw, no ANSI. The buffered org block printed on completion
+    is the natural completion signal.
     """
 
     def __init__(self, workers: int) -> None:
-        self._workers = workers
-        self._slots: dict[int, str] = {}
-        self._active = sys.stdout.isatty() and workers > 1
-        if self._active:
-            # Reserve exactly workers blank lines - no trailing print() newline
-            sys.stdout.write("\n" * workers)
-            sys.stdout.flush()
+        self._active = workers > 1
 
-    def _redraw_unlocked(self) -> None:
-        """Redraw all slot lines in place. Caller must hold _print_lock."""
-        lines = [self._slots.get(i, "") for i in range(self._workers)]
-        up = f"\x1b[{self._workers}A"
-        body = "\n".join(f"\x1b[2K{line}" for line in lines)
-        sys.stdout.write(up + body + "\n")
-        sys.stdout.flush()
-
-    def _redraw(self) -> None:
-        """Redraw under _print_lock. Use for standalone redraws."""
+    def start(self, org: str, idx: int, total: int) -> None:
         if not self._active:
             return
-        with _print_lock:
-            self._redraw_unlocked()
+        pct = (idx / total * 100) if total else 100.0
+        tprint(f"  --> [{idx}/{total} ({pct:.1f}%)] starting: {org}")
 
+    # No-ops kept so call sites don't need to change
     def update(self, slot_id: int, org: str, elapsed: float) -> None:
-        """Set the status line for a worker slot and redraw."""
-        if not self._active:
-            return
-        self._slots[slot_id] = f"  [worker {slot_id + 1}] {org} ... {elapsed:.0f}s"
-        self._redraw()
+        pass
 
     def update_slots_and_redraw(self, updates: dict[int, tuple[str, float]]) -> None:
-        """Batch-update multiple slots and redraw once. Used by the ticker."""
-        if not self._active:
-            return
-        for sid, (org, elapsed) in updates.items():
-            self._slots[sid] = f"  [worker {sid + 1}] {org} ... {elapsed:.0f}s"
-        with _print_lock:
-            self._redraw_unlocked()
+        pass
 
     def clear_slot(self, slot_id: int) -> None:
-        """Clear a worker slot when its org completes."""
-        if not self._active:
-            return
-        self._slots.pop(slot_id, None)
-        self._redraw()
+        pass
 
     def stop(self) -> None:
-        """Clear all slots and move cursor past the display area."""
-        if not self._active:
-            return
-        self._slots.clear()
-        self._redraw()
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -2038,8 +2001,6 @@ def main() -> None:
             _slot_sem = threading.Semaphore(workers)
             _slot_pool = list(range(workers))
             _slot_lock = threading.Lock()
-            _active_slots: dict[int, tuple[str, float]] = {}
-            _active_lock = threading.Lock()
 
             def _acquire_slot() -> int:
                 _slot_sem.acquire()
@@ -2057,31 +2018,12 @@ def main() -> None:
                 """Wrapper that acquires/releases a display slot around process_org."""
                 slot_id = _acquire_slot()
                 org_buf._slot_id = slot_id  # type: ignore[attr-defined]
-                with _active_lock:
-                    _active_slots[slot_id] = (org, time.time())
-                progress.update(slot_id, org, 0)
+                progress.start(org, idx, total_orgs)
                 try:
                     process_org(org, idx, ctx, _cached_clone_dir, org_buf)
                 finally:
-                    with _active_lock:
-                        _active_slots.pop(slot_id, None)
                     _release_slot(slot_id)
                 return org_buf
-
-            _ticker_stop = threading.Event()
-
-            def _ticker() -> None:
-                while not _ticker_stop.is_set():
-                    time.sleep(2)
-                    with _active_lock:
-                        snapshot = dict(_active_slots)
-                    if snapshot:
-                        now = time.time()
-                        updates = {sid: (o, now - t0) for sid, (o, t0) in snapshot.items()}
-                        progress.update_slots_and_redraw(updates)
-
-            ticker_thread = threading.Thread(target=_ticker, daemon=True)
-            ticker_thread.start()
 
             try:
                 with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -2105,8 +2047,6 @@ def main() -> None:
                         else:
                             org_buf.flush()
             finally:
-                _ticker_stop.set()
-                ticker_thread.join(timeout=3)
                 progress.stop()
         else:
             for idx, org in enumerate(orgs, 1):
