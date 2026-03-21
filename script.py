@@ -52,6 +52,100 @@ _rate_limit_pause_until: float = 0.0
 
 
 # ---------------------------------------------------------------------------
+# Per-org output buffer
+# ---------------------------------------------------------------------------
+
+class OrgBuffer:
+    """Collects log lines for one org and flushes them atomically to stdout.
+
+    In sequential mode (workers == 1) flush_on_add=True streams lines
+    immediately, preserving the original behaviour. In parallel mode
+    flush_on_add=False buffers everything until flush() is called at the
+    end of process_org, so output for one org always appears as a single
+    contiguous block.
+    """
+
+    def __init__(self, org: str, org_idx: int, total_orgs: int, flush_on_add: bool = False) -> None:
+        self.org = org
+        self.org_idx = org_idx
+        self.total_orgs = total_orgs
+        self.flush_on_add = flush_on_add
+        self._lines: list[str] = []
+
+    def add(self, msg: str) -> None:
+        if self.flush_on_add:
+            with _print_lock:
+                print(msg, flush=True)
+        else:
+            self._lines.append(msg)
+
+    def flush(self) -> None:
+        """Print all buffered lines atomically. No-op in flush_on_add mode."""
+        if self.flush_on_add or not self._lines:
+            return
+        pct = (self.org_idx / self.total_orgs * 100) if self.total_orgs else 100.0
+        header = f"\n[{self.org_idx}/{self.total_orgs} ({pct:.1f}%)] {self.org}"
+        block = "\n".join([header] + self._lines)
+        try:
+            with _print_lock:
+                print(block, flush=True)
+        finally:
+            self._lines.clear()
+
+    def flush_then_clear(self, progress: "ProgressDisplay", slot_id: int) -> None:
+        """Flush buffered output and clear the progress slot atomically."""
+        if self.flush_on_add:
+            return
+        pct = (self.org_idx / self.total_orgs * 100) if self.total_orgs else 100.0
+        header = f"\n[{self.org_idx}/{self.total_orgs} ({pct:.1f}%)] {self.org}"
+        block = "\n".join([header] + self._lines) if self._lines else header
+        try:
+            with _print_lock:
+                print(block, flush=True)
+        finally:
+            self._lines.clear()
+            progress.clear_slot(slot_id)
+
+
+# ---------------------------------------------------------------------------
+# Live progress display for parallel mode
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Live progress display for parallel mode
+# ---------------------------------------------------------------------------
+
+class ProgressDisplay:
+    """Prints a single status line to stdout when a worker starts an org.
+
+    No ticker, no redraw, no ANSI. The buffered org block printed on completion
+    is the natural completion signal.
+    """
+
+    def __init__(self, workers: int) -> None:
+        self._active = workers > 1
+
+    def start(self, org: str, idx: int, total: int) -> None:
+        if not self._active:
+            return
+        pct = (idx / total * 100) if total else 100.0
+        tprint(f"  --> [{idx}/{total} ({pct:.1f}%)] starting: {org}")
+
+    # No-ops kept so call sites don't need to change
+    def update(self, slot_id: int, org: str, elapsed: float) -> None:
+        pass
+
+    def update_slots_and_redraw(self, updates: dict[int, tuple[str, float]]) -> None:
+        pass
+
+    def clear_slot(self, slot_id: int) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Typed stats container
 # ---------------------------------------------------------------------------
 
@@ -430,7 +524,12 @@ def git_mirror_import(
 # Veracode API helpers
 # ---------------------------------------------------------------------------
 
-def _find_workspace_by_name(org_name: str, api_id: str, api_key: str) -> str | None:
+def _find_workspace_by_name(
+    org_name: str,
+    api_id: str,
+    api_key: str,
+    log: Callable[[str], None] = tprint,
+) -> str | None:
     """Page through workspaces until exact name match; returns UUID or None."""
     page = 0
     while True:
@@ -439,13 +538,13 @@ def _find_workspace_by_name(org_name: str, api_id: str, api_key: str) -> str | N
             params={"filter[workspace]": org_name, "size": 100, "page": page},
         )
         if r.status_code == 401:
-            tprint("  [ERROR] Veracode authentication failed - check credentials")
+            log("  [ERROR] Veracode authentication failed - check credentials")
             return None
         if r.status_code == 403:
-            tprint("  [ERROR] Veracode permission denied - insufficient access")
+            log("  [ERROR] Veracode permission denied - insufficient access")
             return None
         if r.status_code != 200:
-            tprint(f"  [ERROR] Failed to list workspaces: {r.status_code} - {r.text[:200]}")
+            log(f"  [ERROR] Failed to list workspaces: {r.status_code} - {r.text[:200]}")
             return None
 
         body = r.json()
@@ -453,7 +552,7 @@ def _find_workspace_by_name(org_name: str, api_id: str, api_key: str) -> str | N
             if ws.get("name") == org_name:
                 ws_id = ws.get("id")
                 if not ws_id:
-                    tprint(f"  [WARNING] Workspace '{org_name}' matched but has no id in response - skipping")
+                    log(f"  [WARNING] Workspace '{org_name}' matched but has no id in response - skipping")
                     continue
                 return ws_id
 
@@ -465,29 +564,32 @@ def _find_workspace_by_name(org_name: str, api_id: str, api_key: str) -> str | N
     return None
 
 
-def create_veracode_workspace(org_name: str, api_id: str, api_key: str) -> str | None:
+def create_veracode_workspace(
+    org_name: str,
+    api_id: str,
+    api_key: str,
+    log: Callable[[str], None] = tprint,
+) -> str | None:
     """Create or find an existing workspace. POST returns no ID; resolved via follow-up GET."""
     try:
-        existing_id = _find_workspace_by_name(org_name, api_id, api_key)
+        existing_id = _find_workspace_by_name(org_name, api_id, api_key, log)
         if existing_id:
             return existing_id
 
         r = veracode_request("POST", "/srcclr/v3/workspaces", api_id, api_key, json={"name": org_name})
         if r.status_code not in (200, 201):
-            tprint(f"  [ERROR] Failed to create workspace: {r.status_code} - {r.text[:200]}")
+            log(f"  [ERROR] Failed to create workspace: {r.status_code} - {r.text[:200]}")
             return None
 
-        # Veracode's API is eventually consistent after POST — poll until the workspace
-        # becomes visible, up to 3 attempts with 1s between each.
         for attempt in range(3):
-            workspace_id = _find_workspace_by_name(org_name, api_id, api_key)
+            workspace_id = _find_workspace_by_name(org_name, api_id, api_key, log)
             if workspace_id:
                 return workspace_id
             time.sleep(1)
-        tprint(f"  [ERROR] Workspace created but not found after 3 lookup attempts for: {org_name}")
+        log(f"  [ERROR] Workspace created but not found after 3 lookup attempts for: {org_name}")
         return None
     except Exception as exc:
-        tprint(f"  [ERROR] create_veracode_workspace: {exc}")
+        log(f"  [ERROR] create_veracode_workspace: {exc}")
         return None
 
 
@@ -510,6 +612,7 @@ def create_veracode_agent_token(
     org_name: str,
     api_id: str,
     api_key: str,
+    log: Callable[[str], None] = tprint,
 ) -> str | None:
     """Regenerate token if agent exists; create one otherwise.
     None from list_veracode_agents is treated as an error, not an empty list.
@@ -524,7 +627,7 @@ def create_veracode_agent_token(
 
         existing_agents = list_veracode_agents(workspace_id, api_id, api_key)
         if existing_agents is None:
-            tprint(f"  [ERROR] Could not list agents for workspace {workspace_id} - aborting token creation")
+            log(f"  [ERROR] Could not list agents for workspace {workspace_id} - aborting token creation")
             return None
 
         for agent in existing_agents:
@@ -539,9 +642,9 @@ def create_veracode_agent_token(
                     access_token = regen.json().get("access_token")
                     if access_token:
                         return access_token
-                    tprint("  [ERROR] token:regenerate succeeded but no access_token in response")
+                    log("  [ERROR] token:regenerate succeeded but no access_token in response")
                     return None
-                tprint(f"  [ERROR] token:regenerate failed: {regen.status_code} - {regen.text[:200]}")
+                log(f"  [ERROR] token:regenerate failed: {regen.status_code} - {regen.text[:200]}")
                 return None
 
         r = veracode_request(
@@ -551,24 +654,24 @@ def create_veracode_agent_token(
             json={"name": agent_name, "agent_type": "CLI"},
         )
         if r.status_code != 200:
-            tprint(f"  [ERROR] Failed to create agent: {r.status_code} - {r.text[:200]}")
+            log(f"  [ERROR] Failed to create agent: {r.status_code} - {r.text[:200]}")
             return None
         if not r.content:
-            tprint("  [ERROR] Agent POST returned empty body")
+            log("  [ERROR] Agent POST returned empty body")
             return None
         try:
             agent_body = r.json()
         except json.JSONDecodeError:
-            tprint("  [ERROR] Failed to parse agent POST response")
+            log("  [ERROR] Failed to parse agent POST response")
             return None
 
         access_token = agent_body.get("token", {}).get("access_token")
         if access_token:
             return access_token
-        tprint(f"  [ERROR] Agent created but no token.access_token in response: {agent_body}")
+        log(f"  [ERROR] Agent created but no token.access_token in response: {agent_body}")
         return None
     except Exception as exc:
-        tprint(f"  [ERROR] create_veracode_agent_token: {exc}")
+        log(f"  [ERROR] create_veracode_agent_token: {exc}")
         return None
 
 
@@ -576,7 +679,12 @@ def create_veracode_agent_token(
 # GitHub secrets helpers
 # ---------------------------------------------------------------------------
 
-def get_org_public_key(api_base: str, org: str, token: str) -> tuple[str, str] | None:
+def get_org_public_key(
+    api_base: str,
+    org: str,
+    token: str,
+    log: Callable[[str], None] = tprint,
+) -> tuple[str, str] | None:
     """Fetch the org's Actions public key for secret encryption.
 
     Returns (key_id, key) as strings, or None on any failure.
@@ -585,17 +693,17 @@ def get_org_public_key(api_base: str, org: str, token: str) -> tuple[str, str] |
     try:
         r = request("GET", f"{api_base}/orgs/{org}/actions/secrets/public-key", token)
         if r.status_code != 200:
-            tprint(f"  [{org}] Failed to get public key: HTTP {r.status_code}")
+            log(f"  [{org}] Failed to get public key: HTTP {r.status_code}")
             return None
         data = r.json()
         key_id = str(data.get("key_id") or "")
         key = str(data.get("key") or "")
         if not key_id or not key:
-            tprint(f"  [{org}] Public key response missing key_id or key: {data}")
+            log(f"  [{org}] Public key response missing key_id or key: {data}")
             return None
         return key_id, key
     except Exception as exc:
-        tprint(f"  [{org}] Exception fetching public key: {exc}")
+        log(f"  [{org}] Exception fetching public key: {exc}")
         return None
 
 
@@ -607,7 +715,13 @@ def encrypt_secret(public_key: str, secret_value: str) -> str:
     return b64encode(encrypted).decode("utf-8")
 
 
-def secret_exists(api_base: str, org: str, token: str, secret_name: str) -> bool:
+def secret_exists(
+    api_base: str,
+    org: str,
+    token: str,
+    secret_name: str,
+    log: Callable[[str], None] = tprint,
+) -> bool:
     try:
         r = request("GET", f"{api_base}/orgs/{org}/actions/secrets/{secret_name}", token)
         if r.status_code == 200:
@@ -615,12 +729,12 @@ def secret_exists(api_base: str, org: str, token: str, secret_name: str) -> bool
         if r.status_code == 404:
             return False
         if r.status_code == 403:
-            tprint(f"  [{org}] Cannot check secret {secret_name}: token lacks admin:org scope")
+            log(f"  [{org}] Cannot check secret {secret_name}: token lacks admin:org scope")
             return False
-        tprint(f"  [{org}] Unexpected response checking {secret_name}: {r.status_code}")
+        log(f"  [{org}] Unexpected response checking {secret_name}: {r.status_code}")
         return False
     except Exception as exc:
-        tprint(f"  [{org}] Error checking secret {secret_name}: {exc}")
+        log(f"  [{org}] Error checking secret {secret_name}: {exc}")
         return False
 
 
@@ -654,11 +768,12 @@ def set_veracode_secrets(
     veracode_sa_api_id: str,
     veracode_sa_api_key: str,
     veracode_agent_token: str,
+    log: Callable[[str], None] = tprint,
 ) -> tuple[bool, dict[str, str]]:
     """Set all three Veracode secrets. Fetches the org public key once."""
-    key_info = get_org_public_key(api_base, org, github_token)
+    key_info = get_org_public_key(api_base, org, github_token, log)
     if not key_info:
-        tprint(f"  [{org}] Could not fetch org public key - skipping secrets")
+        log(f"  [{org}] Could not fetch org public key - skipping secrets")
         return False, {s: "failed" for s in _VERACODE_SECRET_NAMES}
     key_id, public_key = key_info
 
@@ -678,14 +793,14 @@ def set_veracode_secrets(
             r = request("PUT", f"{api_base}/orgs/{org}/actions/secrets/{secret_name}", github_token, json=payload)
             ok = r.status_code in (201, 204)
             if not ok:
-                tprint(f"    [ERROR] Secret {secret_name} PUT failed: {r.status_code}")
+                log(f"    [ERROR] Secret {secret_name} PUT failed: {r.status_code}")
         except Exception as exc:
-            tprint(f"    [ERROR] Exception setting secret {secret_name}: {exc}")
+            log(f"    [ERROR] Exception setting secret {secret_name}: {exc}")
             ok = False
 
         if ok:
             time.sleep(0.5)
-            verified = secret_exists(api_base, org, github_token, secret_name)
+            verified = secret_exists(api_base, org, github_token, secret_name, log)
             results[secret_name] = "set" if verified else "set_unverified"
         else:
             results[secret_name] = "failed"
@@ -722,7 +837,8 @@ def _inject_teams_regex(content: str, teams_value: str) -> tuple[str, bool]:
 
 
 def inject_teams_into_workflows(
-    api_base: str, org: str, repo: str, token: str, teams_value: str
+    api_base: str, org: str, repo: str, token: str, teams_value: str,
+    log: Callable[[str], None] = tprint,
 ) -> tuple[bool, str]:
     workflow_files = [
         ".github/workflows/veracode-sandbox-scan.yml",
@@ -743,7 +859,7 @@ def inject_teams_into_workflows(
         try:
             new_content, was_changed = _inject_teams_regex(raw_content, teams_value)
         except Exception as exc:
-            tprint(f"  [{org}] Regex injection error for {workflow_path}: {exc}")
+            log(f"  [{org}] Regex injection error for {workflow_path}: {exc}")
             continue
 
         if not was_changed:
@@ -759,7 +875,7 @@ def inject_teams_into_workflows(
         if r.status_code in (200, 201):
             modified_count += 1
         else:
-            tprint(f"  [{org}] Failed to update {workflow_path}: {r.status_code}")
+            log(f"  [{org}] Failed to update {workflow_path}: {r.status_code}")
 
     return (True, f"teams_added_to_{modified_count}_files") if modified_count > 0 else (True, "teams_already_present")
 
@@ -846,7 +962,8 @@ def fetch_upstream_veracode_yml() -> str | None:
 
 
 def inject_veracode_yml(
-    api_base: str, org: str, repo: str, token: str, yml_content: str | None
+    api_base: str, org: str, repo: str, token: str, yml_content: str | None,
+    log: Callable[[str], None] = tprint,
 ) -> tuple[bool, str]:
     """Write the onboarding veracode.yml into the integration repo.
 
@@ -854,7 +971,7 @@ def inject_veracode_yml(
     was not found next to the script and injection is skipped gracefully.
     """
     if yml_content is None:
-        tprint(f"  [{org}] Warning: veracode.yml not found next to script, skipping injection")
+        log(f"  [{org}] Warning: veracode.yml not found next to script, skipping injection")
         return False, "template_not_found"
     return _put_veracode_yml_with_backup(
         api_base, org, repo, token, yml_content,
@@ -869,16 +986,17 @@ def update_veracode_yml_in_repo(
     token: str,
     yml_content: str,
     repo_is_known_present: bool = False,
+    log: Callable[[str], None] = tprint,
 ) -> tuple[bool, str]:
     """Push yml_content to org/repo.
     Accepts repo_is_known_present to skip redundant repo_exists/repo_is_empty calls.
     """
     if not repo_is_known_present:
         if not repo_exists(api_base, org, repo, token):
-            tprint(f"  [{org}] Skipping veracode.yml update - repo '{repo}' not found")
+            log(f"  [{org}] Skipping veracode.yml update - repo '{repo}' not found")
             return False, "repo_not_found"
         if repo_is_empty(api_base, org, repo, token):
-            tprint(f"  [{org}] Skipping veracode.yml update - repo '{repo}' is empty (not yet imported)")
+            log(f"  [{org}] Skipping veracode.yml update - repo '{repo}' is empty (not yet imported)")
             return False, "repo_empty"
     return _put_veracode_yml_with_backup(api_base, org, repo, token, yml_content)
 
@@ -1048,6 +1166,7 @@ def wait_for_main_branch(
     token: str,
     timeout: int = 900,
     poll_interval: int = 10,
+    log: Callable[[str], None] = tprint,
 ) -> bool:
     """Poll until the main branch is visible via the API or timeout is reached.
 
@@ -1067,8 +1186,8 @@ def wait_for_main_branch(
         if remaining <= 0:
             break
         sleep = min(poll_interval, remaining)
-        tprint(f"  [{org}] Waiting for main branch... ({attempt * poll_interval}s elapsed, "
-               f"up to {int(remaining)}s remaining)")
+        log(f"  [{org}] Waiting for main branch... ({attempt * poll_interval}s elapsed, "
+            f"up to {int(remaining)}s remaining)")
         time.sleep(sleep)
         attempt += 1
     return False
@@ -1084,6 +1203,7 @@ def ensure_veracode_repo_imported(
     teams_value: str | None = None,
     web_base: str = "https://github.com",
     cached_clone_dir: str | None = None,
+    log: Callable[[str], None] = tprint,
 ) -> tuple[bool, dict[str, Any]]:
     """Ensure the Veracode integration repo exists and is populated in org.
 
@@ -1099,11 +1219,11 @@ def ensure_veracode_repo_imported(
         default_yml_url = f"{api_base}/repos/{org}/{INTEGRATION_REPO_NAME}/contents/default-veracode.yml"
         if request("GET", default_yml_url, token).status_code == 200:
             return
-        _, yml_action = inject_veracode_yml(api_base, org, INTEGRATION_REPO_NAME, token, onboarding_yml_content)
+        _, yml_action = inject_veracode_yml(api_base, org, INTEGRATION_REPO_NAME, token, onboarding_yml_content, log)
         details["veracode_yml_injected"] = yml_action
         if teams_value:
             _, teams_msg = inject_teams_into_workflows(
-                api_base, org, INTEGRATION_REPO_NAME, token, teams_value
+                api_base, org, INTEGRATION_REPO_NAME, token, teams_value, log
             )
             details["teams_injection"] = teams_msg
 
@@ -1130,28 +1250,27 @@ def ensure_veracode_repo_imported(
 
     if auto_import:
         if not check_git_available():
-            tprint(f"  [{org}] Git CLI not available - skipping auto import")
+            log(f"  [{org}] Git CLI not available - skipping auto import")
         else:
             ok, message = git_mirror_import(
                 INTEGRATION_SOURCE_URL, org, INTEGRATION_REPO_NAME, token, web_base, cached_clone_dir
             )
             if ok:
-                tprint(f"  [{org}] Push succeeded — waiting for GitHub to process the import (up to 15 min)...")
-                branch_visible = wait_for_main_branch(api_base, org, INTEGRATION_REPO_NAME, token)
+                log(f"  [{org}] Push succeeded - waiting for GitHub to process the import (up to 15 min)...")
+                branch_visible = wait_for_main_branch(api_base, org, INTEGRATION_REPO_NAME, token, log=log)
                 if branch_visible:
                     details["status"] = "repo_created_and_imported"
                     details["import_method"] = "git_cli_auto"
                     details["_repo_confirmed_present"] = True
                     _run_post_import_steps()
                     return True, details
-                tprint(f"  [{org}] Warning: main branch not visible after 15 minutes — "
-                       f"GitHub may still be processing. Re-run to complete post-import steps.")
+                log(f"  [{org}] Warning: main branch not visible after 15 minutes - "
+                    f"GitHub may still be processing. Re-run to complete post-import steps.")
                 details["status"] = "repo_created_import_incomplete"
                 details["import_method"] = "git_cli_auto"
                 return True, details
             else:
-                tprint(f"  [{org}] Auto import failed: {message}")
-                # fall through to manual import path
+                log(f"  [{org}] Auto import failed: {message}")
 
     details["status"] = "repo_created_manual_import_required"
     details["import_instructions"] = {
@@ -1300,9 +1419,23 @@ def load_teams_map(teams_file: str) -> dict[str, str]:
 # Per-org processing
 # ---------------------------------------------------------------------------
 
-def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str | None = None) -> None:
+def process_org(
+    org: str,
+    org_idx: int,
+    ctx: RunContext,
+    cached_clone_dir: str | None = None,
+    buf: OrgBuffer | None = None,
+) -> None:
+    # In sequential mode buf is None - create a flush_on_add buffer so behaviour
+    # is identical to before (lines stream immediately via tprint).
+    if buf is None:
+        buf = OrgBuffer(org, org_idx, ctx.total_orgs, flush_on_add=True)
+
     progress_pct = (org_idx / ctx.total_orgs) * 100 if ctx.total_orgs else 100.0
-    tprint(f"\n[{org_idx}/{ctx.total_orgs} ({progress_pct:.1f}%)] Processing: {org}")
+    # Sequential mode: print the header line immediately as before.
+    # Parallel mode: header is prepended by OrgBuffer.flush().
+    if buf.flush_on_add:
+        buf.add(f"\n[{org_idx}/{ctx.total_orgs} ({progress_pct:.1f}%)] Processing: {org}")
 
     now = datetime.now()
     entry: dict[str, Any] = {
@@ -1335,6 +1468,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
             teams_value=teams_value,
             web_base=ctx.web_base,
             cached_clone_dir=cached_clone_dir,
+            log=buf.add,
         )
         repo_confirmed_present = repo_details.pop("_repo_confirmed_present", False)
         entry["veracode_repo"] = {"present": repo_ok, **repo_details}
@@ -1352,7 +1486,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
             ctx.missing_repo_rows.append([org, INTEGRATION_REPO_NAME, f"error:{exc}"])
         with ctx.stats_lock:
             ctx.stats.repo_fail += 1
-        tprint(f"[{org}] Repo error: {str(exc)[:80]}")
+        buf.add(f"  Repo error: {str(exc)[:80]}")
 
     # --- App install check ----------------------------------------------------
     try:
@@ -1373,7 +1507,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
             ctx.missing_app_rows.append([org, APP_SLUG, f"error:{exc}"])
         with ctx.stats_lock:
             ctx.stats.app_missing += 1
-        tprint(f"[{org}] App check error: {str(exc)[:80]}")
+        buf.add(f"  App check error: {str(exc)[:80]}")
 
     # --- veracode.yml update --------------------------------------------------
     if ctx.do_update_yml and ctx.yml_content:
@@ -1381,6 +1515,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
             yml_ok, yml_action = update_veracode_yml_in_repo(
                 ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token, ctx.yml_content,
                 repo_is_known_present=repo_confirmed_present,
+                log=buf.add,
             )
             entry["veracode_yml_update"] = {"success": yml_ok, "action": yml_action}
             with ctx.stats_lock:
@@ -1394,7 +1529,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
             entry["veracode_yml_update"] = {"success": False, "action": f"error:{exc}"}
             with ctx.stats_lock:
                 ctx.stats.yml_failed += 1
-            tprint(f"  [{org}] veracode.yml update error: {str(exc)[:80]}")
+            buf.add(f"  veracode.yml update error: {str(exc)[:80]}")
 
     # --- Secrets --------------------------------------------------------------
     if ctx.dry_run or ctx.do_set_secrets:
@@ -1425,13 +1560,17 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
                 entry["secrets"] = {"status": status, "results": results}
 
             elif ctx.do_set_secrets:
-                workspace_id = create_veracode_workspace(org, ctx.veracode_api_id, ctx.veracode_api_key)
+                workspace_id = create_veracode_workspace(
+                    org, ctx.veracode_api_id, ctx.veracode_api_key, log=buf.add,
+                )
                 if not workspace_id:
                     entry["secrets"] = {"status": "error", "error": "Failed to create or find Veracode workspace"}
                     with ctx.stats_lock:
                         ctx.stats.secrets_fail += 1
                 else:
-                    agent_token = create_veracode_agent_token(workspace_id, org, ctx.veracode_api_id, ctx.veracode_api_key)
+                    agent_token = create_veracode_agent_token(
+                        workspace_id, org, ctx.veracode_api_id, ctx.veracode_api_key, log=buf.add,
+                    )
                     if not agent_token:
                         entry["secrets"] = {"status": "error", "error": "Failed to generate agent token"}
                         with ctx.stats_lock:
@@ -1440,6 +1579,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
                         ok, set_results = set_veracode_secrets(
                             ctx.api_base, org, ctx.token,
                             ctx.veracode_sa_api_id, ctx.veracode_sa_api_key, agent_token,
+                            log=buf.add,
                         )
                         entry["secrets"] = {"status": "set" if ok else "partial", "results": set_results}
                         with ctx.stats_lock:
@@ -1453,7 +1593,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
                 ctx.stats.secrets_fail += 1
                 if ctx.dry_run:
                     ctx.stats.secrets_checked += 1
-            tprint(f"[{org}] Secrets error: {str(exc)[:80]}")
+            buf.add(f"  Secrets error: {str(exc)[:80]}")
 
     # --- Write report + checkpoint (checkpoint saved AFTER all work completes) ---
     with ctx.report_lock:
@@ -1481,7 +1621,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
                 newline="\n",
             )
         except Exception as exc:
-            tprint(f"  [WARNING] Failed to save checkpoint: {exc}")
+            buf.add(f"  [WARNING] Failed to save checkpoint: {exc}")
 
     # --- Console summary line -------------------------------------------------
     repo_status = "✓" if entry.get("veracode_repo", {}).get("present") else "✗"
@@ -1522,7 +1662,9 @@ def process_org(org: str, org_idx: int, ctx: RunContext, cached_clone_dir: str |
         else:
             secrets_status = "  Secrets: ✗"
 
-    tprint(f"[{org}] Repo: {repo_status}{teams_detail}  App: {app_status}{yml_status}{secrets_status}")
+    buf.add(f"  Repo: {repo_status}{teams_detail}  App: {app_status}{yml_status}{secrets_status}")
+    # buf.flush() is called by the caller (as_completed loop in parallel mode,
+    # or directly below in sequential mode) so the slot clear and flush happen atomically.
 
 
 # ---------------------------------------------------------------------------
@@ -1852,17 +1994,60 @@ def main() -> None:
     try:
         if workers > 1:
             print(f"[PARALLEL] Running with {workers} workers\n")
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {
-                    executor.submit(process_org, org, idx, ctx, _cached_clone_dir): org
-                    for idx, org in enumerate(orgs, 1)
-                }
-                for future in as_completed(futures):
-                    org_name = futures[future]
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        tprint(f"[ERROR] Unhandled exception for org {org_name}: {exc}")
+            progress = ProgressDisplay(workers)
+
+            # Semaphore-based slot pool: a slot is only assigned when a worker
+            # actually starts executing, not when the future is submitted to the queue.
+            _slot_sem = threading.Semaphore(workers)
+            _slot_pool = list(range(workers))
+            _slot_lock = threading.Lock()
+
+            def _acquire_slot() -> int:
+                _slot_sem.acquire()
+                with _slot_lock:
+                    return _slot_pool.pop(0)
+
+            def _release_slot(slot_id: int) -> None:
+                with _slot_lock:
+                    _slot_pool.append(slot_id)
+                _slot_sem.release()
+
+            def _process_org_with_slot(
+                org: str, idx: int, org_buf: OrgBuffer
+            ) -> OrgBuffer:
+                """Wrapper that acquires/releases a display slot around process_org."""
+                slot_id = _acquire_slot()
+                org_buf._slot_id = slot_id  # type: ignore[attr-defined]
+                progress.start(org, idx, total_orgs)
+                try:
+                    process_org(org, idx, ctx, _cached_clone_dir, org_buf)
+                finally:
+                    _release_slot(slot_id)
+                return org_buf
+
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    all_futures: dict[Any, tuple[str, OrgBuffer]] = {}
+                    for idx, org in enumerate(orgs, 1):
+                        org_buf = OrgBuffer(org, idx, total_orgs, flush_on_add=False)
+                        f = executor.submit(_process_org_with_slot, org, idx, org_buf)
+                        all_futures[f] = (org, org_buf)
+
+                    for future in as_completed(all_futures):
+                        org_name, org_buf = all_futures[future]
+                        slot_id = getattr(org_buf, "_slot_id", None)
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            tprint(f"[ERROR] Unhandled exception for org {org_name}: {exc}")
+                        # Flush the org's buffered output and clear the display slot
+                        # in one _print_lock acquisition - no interleaving possible.
+                        if slot_id is not None:
+                            org_buf.flush_then_clear(progress, slot_id)
+                        else:
+                            org_buf.flush()
+            finally:
+                progress.stop()
         else:
             for idx, org in enumerate(orgs, 1):
                 process_org(org, idx, ctx, _cached_clone_dir)
