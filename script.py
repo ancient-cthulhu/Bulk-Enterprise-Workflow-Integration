@@ -108,20 +108,12 @@ class OrgBuffer:
             self._lines.clear()
             progress.clear_slot(slot_id)
 
-
-# ---------------------------------------------------------------------------
-# Live progress display for parallel mode
-# ---------------------------------------------------------------------------
-
 # ---------------------------------------------------------------------------
 # Live progress display for parallel mode
 # ---------------------------------------------------------------------------
 
 class ProgressDisplay:
     """Prints a single status line to stdout when a worker starts an org.
-
-    No ticker, no redraw, no ANSI. The buffered org block printed on completion
-    is the natural completion signal.
     """
 
     def __init__(self, workers: int) -> None:
