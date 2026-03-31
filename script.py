@@ -37,8 +37,10 @@ _TEAMS_INJECT_RE = re.compile(
 )
 # Detect a pre-existing `teams:` entry so we don't inject a duplicate.
 _TEAMS_ALREADY_SET_RE = re.compile(r"^\s+teams\s*:", re.MULTILINE)
+# Match existing teams value for update
+_TEAMS_VALUE_RE = re.compile(r'^(\s+teams\s*:\s*)["\']?([^"\'"\n]*)["\']?\s*$', re.MULTILINE)
 
-# Secret names referenced in multiple places — defined once to avoid string duplication
+# Secret names referenced in multiple places - defined once to avoid string duplication
 _VERACODE_SECRET_NAMES: tuple[str, ...] = (
     "VERACODE_API_ID",
     "VERACODE_API_KEY",
@@ -169,6 +171,9 @@ class RunStats:
     yml_updated: int = 0
     yml_skipped: int = 0
     yml_failed: int = 0
+    teams_updated: int = 0
+    teams_skipped: int = 0
+    teams_failed: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +325,7 @@ def _retry_request(
                 time.sleep(wait)
                 continue
             raise
-    # Never reached — loop always returns or raises on the last attempt.
+    # Never reached - loop always returns or raises on the last attempt.
     assert False, "unreachable"  # pragma: no cover
 
 
@@ -412,7 +417,7 @@ def finalize_report(report_path: Path) -> None:
                 try:
                     entries.append(json.loads(line))
                 except json.JSONDecodeError as exc:
-                    print(f"  [WARNING] Skipping corrupt report line {lineno}: {exc} — {line[:80]}", file=sys.stderr)
+                    print(f"  [WARNING] Skipping corrupt report line {lineno}: {exc} - {line[:80]}", file=sys.stderr)
     tmp = report_path.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8", newline="\n") as f:
         json.dump(entries, f, indent=2)
@@ -440,7 +445,7 @@ def write_orgs_txt(path: Path, orgs: list[str]) -> None:
 def check_git_available() -> bool:
     """Return True if the git CLI is accessible.
 
-    Cached after the first call — git availability cannot change mid-run.
+    Cached after the first call - git availability cannot change mid-run.
     Tests that mock subprocess should call check_git_available.cache_clear()
     before and after patching to avoid stale cache state.
     """
@@ -836,15 +841,43 @@ def _inject_teams_regex(content: str, teams_value: str) -> tuple[str, bool]:
     return _TEAMS_INJECT_RE.sub(replacer, content), changed
 
 
+def _update_teams_value(content: str, teams_value: str) -> tuple[str, bool]:
+    """Update existing teams: parameter to new value.
+    
+    Returns (new_content, was_changed). Only changes if new value differs.
+    """
+    safe_value = teams_value.replace('"', '\\"')
+    changed = False
+    
+    def replacer(m: re.Match) -> str:
+        nonlocal changed
+        prefix = m.group(1)
+        current_value = m.group(2).strip()
+        if current_value == teams_value or current_value == safe_value:
+            return m.group(0)
+        changed = True
+        return f'{prefix}"{safe_value}"'
+    
+    new_content = _TEAMS_VALUE_RE.sub(replacer, content)
+    return new_content, changed
+
+
 def inject_teams_into_workflows(
     api_base: str, org: str, repo: str, token: str, teams_value: str,
+    update_existing: bool = False,
     log: Callable[[str], None] = tprint,
 ) -> tuple[bool, str]:
+    """Inject or update teams parameter in workflow files.
+    
+    If update_existing=True, also updates existing teams values to the new value.
+    This makes the operation idempotent - can be re-run to change teams.
+    """
     workflow_files = [
         ".github/workflows/veracode-sandbox-scan.yml",
         ".github/workflows/veracode-policy-scan.yml",
     ]
     modified_count = 0
+    files_checked = 0
 
     for workflow_path in workflow_files:
         url = f"{api_base}/repos/{org}/{repo}/contents/{workflow_path}"
@@ -852,21 +885,29 @@ def inject_teams_into_workflows(
         if r.status_code != 200:
             continue
 
+        files_checked += 1
         file_data = r.json()
         sha = file_data.get("sha")
         raw_content = b64decode(file_data.get("content", "")).decode("utf-8")
 
         try:
-            new_content, was_changed = _inject_teams_regex(raw_content, teams_value)
+            # First try to inject teams where missing
+            new_content, was_injected = _inject_teams_regex(raw_content, teams_value)
+            
+            # If update_existing is True, also update any existing teams values
+            was_updated = False
+            if update_existing:
+                new_content, was_updated = _update_teams_value(new_content, teams_value)
+            
+            if not was_injected and not was_updated:
+                continue
+                
         except Exception as exc:
             log(f"  [{org}] Regex injection error for {workflow_path}: {exc}")
             continue
 
-        if not was_changed:
-            continue
-
         payload = {
-            "message": f"Add teams parameter to {workflow_path.split('/')[-1]}",
+            "message": f"Update teams parameter in {workflow_path.split('/')[-1]}",
             "content": b64encode(new_content.encode("utf-8")).decode("utf-8"),
             "sha": sha,
             "branch": "main",
@@ -877,7 +918,11 @@ def inject_teams_into_workflows(
         else:
             log(f"  [{org}] Failed to update {workflow_path}: {r.status_code}")
 
-    return (True, f"teams_added_to_{modified_count}_files") if modified_count > 0 else (True, "teams_already_present")
+    if modified_count > 0:
+        return True, f"teams_updated_{modified_count}_files"
+    if files_checked == 0:
+        return False, "no_workflow_files_found"
+    return True, "teams_already_current"
 
 
 # ---------------------------------------------------------------------------
@@ -1170,7 +1215,7 @@ def wait_for_main_branch(
 ) -> bool:
     """Poll until the main branch is visible via the API or timeout is reached.
 
-    GitHub processes a mirror push asynchronously — the branch becomes visible
+    GitHub processes a mirror push asynchronously - the branch becomes visible
     some time after `git push --mirror` returns success. On large repos or under
     load this can take 30-90 seconds or more.
 
@@ -1200,7 +1245,6 @@ def ensure_veracode_repo_imported(
     do_apply: bool,
     onboarding_yml_content: str | None,
     auto_import: bool = False,
-    teams_value: str | None = None,
     web_base: str = "https://github.com",
     cached_clone_dir: str | None = None,
     log: Callable[[str], None] = tprint,
@@ -1210,22 +1254,20 @@ def ensure_veracode_repo_imported(
     Returns (repo_ok, details). details contains status fields and, on success,
     an internal '_repo_confirmed_present' key that callers pop to skip redundant
     existence checks for downstream operations.
+    
+    NOTE: Teams injection is handled separately in process_org for idempotency.
     """
     details: dict[str, Any] = {"repo": INTEGRATION_REPO_NAME}
     exists = repo_exists(api_base, org, INTEGRATION_REPO_NAME, token)
     is_empty = exists and repo_is_empty(api_base, org, INTEGRATION_REPO_NAME, token)
 
     def _run_post_import_steps() -> None:
+        """Run post-import steps (veracode.yml injection only, teams handled separately)."""
         default_yml_url = f"{api_base}/repos/{org}/{INTEGRATION_REPO_NAME}/contents/default-veracode.yml"
         if request("GET", default_yml_url, token).status_code == 200:
             return
         _, yml_action = inject_veracode_yml(api_base, org, INTEGRATION_REPO_NAME, token, onboarding_yml_content, log)
         details["veracode_yml_injected"] = yml_action
-        if teams_value:
-            _, teams_msg = inject_teams_into_workflows(
-                api_base, org, INTEGRATION_REPO_NAME, token, teams_value, log
-            )
-            details["teams_injection"] = teams_msg
 
     if exists and not is_empty:
         details["status"] = "repo_exists"
@@ -1353,21 +1395,21 @@ def validate_credentials(
         r = request("GET", f"{api_base}/user", token)
         if r.status_code == 200:
             username = r.json().get("login", "unknown")
-            print(f"  ✓ GitHub token valid (user: {username})")
+            print(f"  [OK] GitHub token valid (user: {username})")
             scopes = r.headers.get("X-OAuth-Scopes", "")
-            print(f"  ✓ GitHub token scopes: {scopes}" if scopes else "  ⚠ Could not determine GitHub token scopes")
+            print(f"  [OK] GitHub token scopes: {scopes}" if scopes else "  [WARN] Could not determine GitHub token scopes")
         elif r.status_code == 401:
             errors.append("GitHub token is invalid or expired")
-            print("  ✗ GitHub token authentication failed")
+            print("  [FAIL] GitHub token authentication failed")
         elif r.status_code == 403:
             errors.append("GitHub token lacks required permissions")
-            print("  ✗ GitHub token permission denied")
+            print("  [FAIL] GitHub token permission denied")
         else:
             errors.append(f"GitHub API returned unexpected status: {r.status_code}")
-            print(f"  ✗ GitHub API error: {r.status_code}")
+            print(f"  [FAIL] GitHub API error: {r.status_code}")
     except Exception as exc:
         errors.append(f"GitHub API connection failed: {str(exc)[:100]}")
-        print(f"  ✗ GitHub API connection error: {str(exc)[:80]}")
+        print(f"  [FAIL] GitHub API connection error: {str(exc)[:80]}")
 
     if check_veracode and veracode_api_id and veracode_api_key:
         try:
@@ -1376,24 +1418,24 @@ def validate_credentials(
                 params={"size": 1, "page": 0},
             )
             if r.status_code == 200:
-                print("  ✓ Veracode credentials valid")
+                print("  [OK] Veracode credentials valid")
             elif r.status_code == 401:
                 errors.append("Veracode credentials are invalid")
-                print("  ✗ Veracode authentication failed")
+                print("  [FAIL] Veracode authentication failed")
             elif r.status_code == 403:
                 errors.append("Veracode credentials lack required permissions")
-                print("  ✗ Veracode permission denied")
+                print("  [FAIL] Veracode permission denied")
             else:
                 errors.append(f"Veracode API returned unexpected status: {r.status_code}")
-                print(f"  ✗ Veracode API error: {r.status_code}")
+                print(f"  [FAIL] Veracode API error: {r.status_code}")
         except Exception as exc:
             errors.append(f"Veracode API connection failed: {str(exc)[:100]}")
-            print(f"  ✗ Veracode API connection error: {str(exc)[:80]}")
+            print(f"  [FAIL] Veracode API connection error: {str(exc)[:80]}")
 
     if errors:
-        print(f"\n[VALIDATION] ✗ Failed with {len(errors)} error(s)")
+        print(f"\n[VALIDATION] Failed with {len(errors)} error(s)")
         return False, errors
-    print("[VALIDATION] ✓ All credentials validated successfully\n")
+    print("[VALIDATION] All credentials validated successfully\n")
     return True, []
 
 
@@ -1465,7 +1507,6 @@ def process_org(
             do_apply=ctx.do_apply_repo,
             onboarding_yml_content=ctx.onboarding_yml_content,
             auto_import=ctx.do_apply_repo,
-            teams_value=teams_value,
             web_base=ctx.web_base,
             cached_clone_dir=cached_clone_dir,
             log=buf.add,
@@ -1487,6 +1528,40 @@ def process_org(
         with ctx.stats_lock:
             ctx.stats.repo_fail += 1
         buf.add(f"  Repo error: {str(exc)[:80]}")
+
+    # --- Teams injection (independent, idempotent) ----------------------------
+    # Runs whenever --set-teams-* flag is set, regardless of repo import status.
+    # Updates existing teams values to ensure idempotency.
+    if ctx.do_set_teams and teams_value:
+        # Check if repo exists and is not empty before attempting teams injection
+        try:
+            if repo_confirmed_present or (
+                repo_exists(ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token) and
+                not repo_is_empty(ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token)
+            ):
+                teams_ok, teams_msg = inject_teams_into_workflows(
+                    ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token, teams_value,
+                    update_existing=True,  # Enable idempotent updates
+                    log=buf.add,
+                )
+                entry["teams_injection"] = {"success": teams_ok, "action": teams_msg, "value": teams_value}
+                with ctx.stats_lock:
+                    if teams_ok:
+                        if "updated" in teams_msg:
+                            ctx.stats.teams_updated += 1
+                        else:
+                            ctx.stats.teams_skipped += 1
+                    else:
+                        ctx.stats.teams_failed += 1
+            else:
+                entry["teams_injection"] = {"success": False, "action": "repo_not_ready", "value": teams_value}
+                with ctx.stats_lock:
+                    ctx.stats.teams_skipped += 1
+        except Exception as exc:
+            entry["teams_injection"] = {"success": False, "action": f"error:{exc}", "value": teams_value}
+            with ctx.stats_lock:
+                ctx.stats.teams_failed += 1
+            buf.add(f"  Teams injection error: {str(exc)[:80]}")
 
     # --- App install check ----------------------------------------------------
     try:
@@ -1603,7 +1678,7 @@ def process_org(
     with ctx.stats_lock:
         ctx.stats.processed += 1
 
-    # use len(ctx.completed_orgs) inside checkpoint_lock for the completion count —
+    # use len(ctx.completed_orgs) inside checkpoint_lock for the completion count -
     # avoids reading ctx.stats.processed across two different locks.
     with ctx.checkpoint_lock:
         ctx.completed_orgs.append(org)
@@ -1624,43 +1699,47 @@ def process_org(
             buf.add(f"  [WARNING] Failed to save checkpoint: {exc}")
 
     # --- Console summary line -------------------------------------------------
-    repo_status = "✓" if entry.get("veracode_repo", {}).get("present") else "✗"
-    app_status = "✓" if entry.get("workflow_app", {}).get("installed") else "✗"
+    repo_status = "[OK]" if entry.get("veracode_repo", {}).get("present") else "[FAIL]"
+    app_status = "[OK]" if entry.get("workflow_app", {}).get("installed") else "[FAIL]"
 
     teams_detail = ""
     if ctx.do_set_teams:
-        injection = entry.get("veracode_repo", {}).get("teams_injection")
-        if teams_value:
-            teams_detail = f" ({injection})" if injection else " (teams_injection_error)"
-        else:
-            teams_detail = " (no teams configured)"
+        teams_info = entry.get("teams_injection", {})
+        if teams_info:
+            action = teams_info.get("action", "")
+            if teams_info.get("success"):
+                teams_detail = f" Teams: [OK] ({action})"
+            else:
+                teams_detail = f" Teams: [FAIL] ({action})"
+        elif not teams_value:
+            teams_detail = " Teams: (no teams configured)"
 
     yml_status = ""
     if ctx.do_update_yml:
         yml_info = entry.get("veracode_yml_update", {})
-        yml_status = f"  YML: {'✓' if yml_info.get('success') else '✗'} ({yml_info.get('action', 'error')})"
+        yml_status = f"  YML: {'[OK]' if yml_info.get('success') else '[FAIL]'} ({yml_info.get('action', 'error')})"
 
     secrets_status = ""
     if "secrets" in entry:
         s = entry["secrets"]
         sec_status = s.get("status", "")
         if sec_status == "no_permission":
-            secrets_status = "  Secrets: ⚠ (no_permission - token needs admin:org scope)"
+            secrets_status = "  Secrets: [WARN] (no_permission - token needs admin:org scope)"
         elif sec_status == "all_exist":
-            secrets_status = "  Secrets: ✓ (all exist)"
+            secrets_status = "  Secrets: [OK] (all exist)"
         elif sec_status == "all_missing":
-            secrets_status = "  Secrets: ✗ (all missing)"
+            secrets_status = "  Secrets: [FAIL] (all missing)"
         elif sec_status == "partial":
             r_map = s.get("results", {})
             ec = sum(1 for v in r_map.values() if v == "exists")
             mc = sum(1 for v in r_map.values() if v == "missing")
-            secrets_status = f"  Secrets: ⚠ ({ec} exist, {mc} missing)"
+            secrets_status = f"  Secrets: [WARN] ({ec} exist, {mc} missing)"
         elif sec_status == "set":
-            secrets_status = "  Secrets: ✓"
+            secrets_status = "  Secrets: [OK]"
         elif sec_status == "error":
-            secrets_status = "  Secrets: ✗ (error)"
+            secrets_status = "  Secrets: [FAIL] (error)"
         else:
-            secrets_status = "  Secrets: ✗"
+            secrets_status = "  Secrets: [FAIL]"
 
     buf.add(f"  Repo: {repo_status}{teams_detail}  App: {app_status}{yml_status}{secrets_status}")
     # buf.flush() is called by the caller (as_completed loop in parallel mode,
@@ -1939,7 +2018,7 @@ def main() -> None:
         if do_apply_repo:
             print("  - Create and import veracode repos")
         if do_set_teams:
-            print("  - Inject teams parameters into workflows")
+            print("  - Inject/update teams parameters into workflows")
         if do_update_yml:
             print(f"  - Push veracode.yml from {yml_source_label}")
         if do_set_secrets:
@@ -2087,6 +2166,11 @@ def main() -> None:
     app_total = st.app_installed + st.app_missing
     if app_total > 0:
         print(f"Workflow App    : {st.app_installed} installed, {st.app_missing} missing (see manual_install_links.csv)")
+
+    # Teams stats (only show when teams flag was used)
+    if do_set_teams:
+        teams_total = st.teams_updated + st.teams_skipped + st.teams_failed
+        print(f"Teams Injection : {st.teams_updated} updated, {st.teams_skipped} already current/skipped, {st.teams_failed} failed (of {teams_total} orgs)")
 
     if do_update_yml:
         yml_total = st.yml_updated + st.yml_skipped + st.yml_failed
