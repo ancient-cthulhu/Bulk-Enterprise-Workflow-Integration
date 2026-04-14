@@ -27,7 +27,6 @@ INTEGRATION_REPO_NAME = "veracode"
 INTEGRATION_SOURCE_URL = "https://github.com/veracode/github-actions-integration.git"
 API_VER = "2022-11-28"
 
-# Pre-compiled regex constants (compiled once at module load, not per call)
 _TEAMS_INJECT_RE = re.compile(
     r"([ \t]*(?:-[ \t]+)?uses:[ \t]+veracode/(?:veracode-)?uploadandscan-action@[^\n]+\n"
     r"(?:[ \t]+[^\n]+\n)*?"
@@ -35,19 +34,15 @@ _TEAMS_INJECT_RE = re.compile(
     r"((?:[ \t]+[^\n]+\n)+)",
     re.MULTILINE,
 )
-# Detect a pre-existing `teams:` entry so we don't inject a duplicate.
 _TEAMS_ALREADY_SET_RE = re.compile(r"^\s+teams\s*:", re.MULTILINE)
-# Match existing teams value for update
 _TEAMS_VALUE_RE = re.compile(r'^(\s+teams\s*:\s*)["\']?([^"\'"\n]*)["\']?\s*$', re.MULTILINE)
 
-# Secret names referenced in multiple places - defined once to avoid string duplication
 _VERACODE_SECRET_NAMES: tuple[str, ...] = (
     "VERACODE_API_ID",
     "VERACODE_API_KEY",
     "VERACODE_AGENT_TOKEN",
 )
 
-# Thread-safety primitives
 _print_lock = threading.Lock()
 _rate_limit_lock = threading.Lock()
 _rate_limit_pause_until: float = 0.0
@@ -58,15 +53,6 @@ _rate_limit_pause_until: float = 0.0
 # ---------------------------------------------------------------------------
 
 class OrgBuffer:
-    """Collects log lines for one org and flushes them atomically to stdout.
-
-    In sequential mode (workers == 1) flush_on_add=True streams lines
-    immediately, preserving the original behaviour. In parallel mode
-    flush_on_add=False buffers everything until flush() is called at the
-    end of process_org, so output for one org always appears as a single
-    contiguous block.
-    """
-
     def __init__(self, org: str, org_idx: int, total_orgs: int, flush_on_add: bool = False) -> None:
         self.org = org
         self.org_idx = org_idx
@@ -82,7 +68,6 @@ class OrgBuffer:
             self._lines.append(msg)
 
     def flush(self) -> None:
-        """Print all buffered lines atomically. No-op in flush_on_add mode."""
         if self.flush_on_add or not self._lines:
             return
         pct = (self.org_idx / self.total_orgs * 100) if self.total_orgs else 100.0
@@ -95,7 +80,6 @@ class OrgBuffer:
             self._lines.clear()
 
     def flush_then_clear(self, progress: "ProgressDisplay", slot_id: int) -> None:
-        """Flush buffered output and clear the progress slot atomically."""
         if self.flush_on_add:
             return
         pct = (self.org_idx / self.total_orgs * 100) if self.total_orgs else 100.0
@@ -108,14 +92,12 @@ class OrgBuffer:
             self._lines.clear()
             progress.clear_slot(slot_id)
 
+
 # ---------------------------------------------------------------------------
 # Live progress display for parallel mode
 # ---------------------------------------------------------------------------
 
 class ProgressDisplay:
-    """Prints a single status line to stdout when a worker starts an org.
-    """
-
     def __init__(self, workers: int) -> None:
         self._active = workers > 1
 
@@ -125,7 +107,6 @@ class ProgressDisplay:
         pct = (idx / total * 100) if total else 100.0
         tprint(f"  --> [{idx}/{total} ({pct:.1f}%)] starting: {org}")
 
-    # No-ops kept so call sites don't need to change
     def update(self, slot_id: int, org: str, elapsed: float) -> None:
         pass
 
@@ -166,13 +147,13 @@ class RunStats:
     teams_updated: int = 0
     teams_skipped: int = 0
     teams_failed: int = 0
+    teams_created_on_platform: int = 0
+    teams_already_exist_on_platform: int = 0
+    teams_create_failed_on_platform: int = 0
 
 
 # ---------------------------------------------------------------------------
 # Shared run context
-# All values are passed explicitly so every function is testable in isolation.
-# Locks are fields rather than module-level variables so multiple contexts can
-# coexist in tests without cross-contamination.
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -184,10 +165,11 @@ class RunContext:
     do_set_secrets: bool
     do_set_teams: bool
     do_update_yml: bool
+    do_create_teams: bool
     dry_run: bool
-    teams_mode: Literal["auto", "file", "hybrid", "none"]  # teams injection strategy
-    yml_content: str | None             # content for --update-veracode-yml
-    onboarding_yml_content: str | None  # content for --import-repo post-steps
+    teams_mode: Literal["auto", "file", "hybrid", "none"]
+    yml_content: str | None
+    onboarding_yml_content: str | None
     teams_map: dict[str, str]
     team_prefix: str
     veracode_api_id: str | None
@@ -208,12 +190,14 @@ class RunContext:
     completed_orgs: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        """Validate invariants implied by flag combinations."""
         if self.do_set_secrets:
             if not self.veracode_api_id or not self.veracode_api_key:
                 raise ValueError("do_set_secrets requires veracode_api_id and veracode_api_key")
             if not self.veracode_sa_api_id or not self.veracode_sa_api_key:
                 raise ValueError("do_set_secrets requires veracode_sa_api_id and veracode_sa_api_key")
+        if self.do_create_teams:
+            if not self.veracode_api_id or not self.veracode_api_key:
+                raise ValueError("do_create_teams requires veracode_api_id and veracode_api_key")
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +205,6 @@ class RunContext:
 # ---------------------------------------------------------------------------
 
 def tprint(*args: Any, **kwargs: Any) -> None:
-    """Thread-safe print. Safe to call from any thread, including the main thread."""
     with _print_lock:
         print(*args, **kwargs)
 
@@ -255,13 +238,11 @@ def check_rate_limit(response: requests.Response) -> None:
     remaining = int(remaining_hdr)
     reset_time = int(reset_hdr)
 
-    # Warn at 100 remaining and every 10 below that to avoid flooding parallel logs.
     if remaining < 100 and remaining % 10 == 0:
         reset_dt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reset_time))
         tprint(f"  [WARNING] Rate limit low: {remaining} requests remaining (resets at {reset_dt})")
 
     if remaining < 10:
-        # Take a single clock sample inside the lock so resume_at is consistent.
         with _rate_limit_lock:
             now = time.time()
             wait_seconds = max(reset_time - int(now), 0) + 5
@@ -317,7 +298,6 @@ def _retry_request(
                 time.sleep(wait)
                 continue
             raise
-    # Never reached - loop always returns or raises on the last attempt.
     assert False, "unreachable"  # pragma: no cover
 
 
@@ -387,18 +367,11 @@ def write_csv(path: Path, header: list[str], rows: list[list[str]]) -> None:
 
 
 def append_report_entry(report_path: Path, entry: dict[str, Any]) -> None:
-    """Append one JSONL line. O(1) per write regardless of report size."""
     with report_path.open("a", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(entry) + "\n")
 
 
 def finalize_report(report_path: Path) -> None:
-    """Convert JSONL to a pretty-printed JSON array. Called once after all orgs complete.
-
-    Uses an atomic rename so the original JSONL file is preserved intact if the
-    process is interrupted during finalization. Corrupt lines are warned about
-    instead of silently dropped.
-    """
     if not report_path.exists():
         return
     entries: list[Any] = []
@@ -414,7 +387,7 @@ def finalize_report(report_path: Path) -> None:
     with tmp.open("w", encoding="utf-8", newline="\n") as f:
         json.dump(entries, f, indent=2)
         f.write("\n")
-    tmp.replace(report_path)  # atomic on POSIX; near-atomic on Windows
+    tmp.replace(report_path)
 
 
 def write_teams_map_csv(path: Path, orgs: list[str]) -> None:
@@ -435,12 +408,6 @@ def write_orgs_txt(path: Path, orgs: list[str]) -> None:
 
 @functools.lru_cache(maxsize=1)
 def check_git_available() -> bool:
-    """Return True if the git CLI is accessible.
-
-    Cached after the first call - git availability cannot change mid-run.
-    Tests that mock subprocess should call check_git_available.cache_clear()
-    before and after patching to avoid stale cache state.
-    """
     try:
         result = subprocess.run(["git", "--version"], capture_output=True, timeout=10)
         return result.returncode == 0
@@ -449,8 +416,6 @@ def check_git_available() -> bool:
 
 
 def git_clone_bare(source_url: str) -> tuple[bool, str, str | None]:
-    """Clone source_url as a bare repo. Returns (success, message, temp_dir).
-    Caller owns cleanup of temp_dir on success."""
     temp_dir: str | None = None
     try:
         temp_dir = tempfile.mkdtemp(prefix="veracode-clone-")
@@ -462,7 +427,7 @@ def git_clone_bare(source_url: str) -> tuple[bool, str, str | None]:
         if result.returncode != 0:
             return False, f"Clone failed: {result.stderr}", None
         out = temp_dir
-        temp_dir = None  # transfer ownership to caller; suppress finally cleanup
+        temp_dir = None
         return True, "Clone successful", out
     except Exception as exc:
         return False, str(exc), None
@@ -479,14 +444,12 @@ def git_mirror_import(
     web_base: str = "https://github.com",
     cached_clone_dir: str | None = None,
 ) -> tuple[bool, str]:
-    """Mirror-push the integration repo into target_org/target_repo."""
     temp_dir: str | None = None
     try:
         temp_dir = tempfile.mkdtemp(prefix="veracode-import-")
         bare_repo = os.path.join(temp_dir, "repo.git")
 
         if cached_clone_dir:
-            # Each worker gets its own copy so concurrent pushes don't share git state.
             shutil.copytree(os.path.join(cached_clone_dir, "repo.git"), bare_repo)
         else:
             clone_result = subprocess.run(
@@ -527,7 +490,6 @@ def _find_workspace_by_name(
     api_key: str,
     log: Callable[[str], None] = tprint,
 ) -> str | None:
-    """Page through workspaces until exact name match; returns UUID or None."""
     page = 0
     while True:
         r = veracode_request(
@@ -567,7 +529,6 @@ def create_veracode_workspace(
     api_key: str,
     log: Callable[[str], None] = tprint,
 ) -> str | None:
-    """Create or find an existing workspace. POST returns no ID; resolved via follow-up GET."""
     try:
         existing_id = _find_workspace_by_name(org_name, api_id, api_key, log)
         if existing_id:
@@ -591,10 +552,6 @@ def create_veracode_workspace(
 
 
 def list_veracode_agents(workspace_id: str, api_id: str, api_key: str) -> list[dict[str, Any]] | None:
-    """Return the agent list for a workspace, or None on any API error.
-
-    Callers must distinguish None (error) from [] (no agents).
-    """
     try:
         r = veracode_request("GET", f"/srcclr/v3/workspaces/{workspace_id}/agents", api_id, api_key)
         if r.status_code == 200:
@@ -611,9 +568,6 @@ def create_veracode_agent_token(
     api_key: str,
     log: Callable[[str], None] = tprint,
 ) -> str | None:
-    """Regenerate token if agent exists; create one otherwise.
-    None from list_veracode_agents is treated as an error, not an empty list.
-    """
     try:
         suffix = "-agt"
         max_org_len = 20 - len(suffix)
@@ -673,6 +627,107 @@ def create_veracode_agent_token(
 
 
 # ---------------------------------------------------------------------------
+# Veracode Identity API - Team management
+# ---------------------------------------------------------------------------
+
+def _find_veracode_team_by_name(
+    team_name: str,
+    api_id: str,
+    api_key: str,
+    log: Callable[[str], None] = tprint,
+) -> str | None:
+    """Page through all org teams until exact name match; returns team_id (UUID) or None."""
+    page = 0
+    while True:
+        r = veracode_request(
+            "GET", "/api/authn/v2/teams", api_id, api_key,
+            params={"all_for_org": "true", "size": 100, "page": page},
+        )
+        if r.status_code == 401:
+            log("  [ERROR] Veracode authentication failed (Identity API) - check credentials")
+            return None
+        if r.status_code == 403:
+            log("  [ERROR] Veracode permission denied (Identity API) - need Administrator role")
+            return None
+        if r.status_code != 200:
+            log(f"  [ERROR] Failed to list teams: {r.status_code} - {r.text[:200]}")
+            return None
+
+        body = r.json()
+        for team in body.get("_embedded", {}).get("teams", []):
+            if team.get("team_name") == team_name:
+                tid = team.get("team_id")
+                if not tid:
+                    log(f"  [WARNING] Team '{team_name}' matched but has no team_id - skipping")
+                    continue
+                return tid
+
+        page_meta = body.get("page", {})
+        total_pages = page_meta.get("total_pages", 1)
+        if page >= total_pages - 1:
+            break
+        page += 1
+    return None
+
+
+def create_veracode_team(
+    team_name: str,
+    api_id: str,
+    api_key: str,
+    log: Callable[[str], None] = tprint,
+) -> str | None:
+    """Create a team on the Veracode platform via Identity API. Returns team_id (UUID) or None."""
+    try:
+        r = veracode_request(
+            "POST", "/api/authn/v2/teams", api_id, api_key,
+            json={"team_name": team_name},
+        )
+        if r.status_code in (200, 201):
+            body = r.json()
+            tid = body.get("team_id")
+            if tid:
+                return tid
+            log(f"  [WARNING] Team POST succeeded but no team_id in response: {str(body)[:200]}")
+        elif r.status_code == 409:
+            log(f"  [INFO] Team '{team_name}' already exists (409 conflict)")
+        else:
+            log(f"  [ERROR] Failed to create team '{team_name}': {r.status_code} - {r.text[:200]}")
+            return None
+
+        for attempt in range(3):
+            tid = _find_veracode_team_by_name(team_name, api_id, api_key, log)
+            if tid:
+                return tid
+            time.sleep(1)
+        log(f"  [ERROR] Team created/exists but not found after lookup for: {team_name}")
+        return None
+    except Exception as exc:
+        log(f"  [ERROR] create_veracode_team: {exc}")
+        return None
+
+
+def ensure_veracode_team(
+    team_name: str,
+    api_id: str,
+    api_key: str,
+    log: Callable[[str], None] = tprint,
+) -> tuple[str | None, str]:
+    """Find or create a Veracode platform team by name.
+
+    Returns (team_id, action) where action is one of:
+    'already_exists', 'created', 'error'.
+    """
+    existing_id = _find_veracode_team_by_name(team_name, api_id, api_key, log)
+    if existing_id:
+        return existing_id, "already_exists"
+
+    new_id = create_veracode_team(team_name, api_id, api_key, log)
+    if new_id:
+        return new_id, "created"
+    return None, "error"
+
+
+# ---------------------------------------------------------------------------
 # GitHub secrets helpers
 # ---------------------------------------------------------------------------
 
@@ -682,11 +737,6 @@ def get_org_public_key(
     token: str,
     log: Callable[[str], None] = tprint,
 ) -> tuple[str, str] | None:
-    """Fetch the org's Actions public key for secret encryption.
-
-    Returns (key_id, key) as strings, or None on any failure.
-    Both fields are validated to be non-empty strings before returning.
-    """
     try:
         r = request("GET", f"{api_base}/orgs/{org}/actions/secrets/public-key", token)
         if r.status_code != 200:
@@ -736,11 +786,6 @@ def secret_exists(
 
 
 def check_veracode_secrets_status(api_base: str, org: str, github_token: str) -> dict[str, str]:
-    """Read-only check of all three Veracode secrets for one org.
-
-    Returns a dict mapping each secret name to one of:
-    'exists', 'missing', 'no_permission', or 'error'.
-    """
     results: dict[str, str] = {}
     for secret_name in _VERACODE_SECRET_NAMES:
         try:
@@ -767,7 +812,6 @@ def set_veracode_secrets(
     veracode_agent_token: str,
     log: Callable[[str], None] = tprint,
 ) -> tuple[bool, dict[str, str]]:
-    """Set all three Veracode secrets. Fetches the org public key once."""
     key_info = get_org_public_key(api_base, org, github_token, log)
     if not key_info:
         log(f"  [{org}] Could not fetch org public key - skipping secrets")
@@ -811,12 +855,6 @@ def set_veracode_secrets(
 # ---------------------------------------------------------------------------
 
 def _inject_teams_regex(content: str, teams_value: str) -> tuple[str, bool]:
-    """Inject a `teams:` parameter into every uploadandscan-action `with:` block
-    that does not already have one.
-
-    Returns (new_content, was_changed). teams_value is escaped before insertion
-    so that any embedded double-quotes produce valid YAML.
-    """
     changed = False
 
     def replacer(m: re.Match) -> str:
@@ -834,13 +872,9 @@ def _inject_teams_regex(content: str, teams_value: str) -> tuple[str, bool]:
 
 
 def _update_teams_value(content: str, teams_value: str) -> tuple[str, bool]:
-    """Update existing teams: parameter to new value.
-    
-    Returns (new_content, was_changed). Only changes if new value differs.
-    """
     safe_value = teams_value.replace('"', '\\"')
     changed = False
-    
+
     def replacer(m: re.Match) -> str:
         nonlocal changed
         prefix = m.group(1)
@@ -849,7 +883,7 @@ def _update_teams_value(content: str, teams_value: str) -> tuple[str, bool]:
             return m.group(0)
         changed = True
         return f'{prefix}"{safe_value}"'
-    
+
     new_content = _TEAMS_VALUE_RE.sub(replacer, content)
     return new_content, changed
 
@@ -859,11 +893,6 @@ def inject_teams_into_workflows(
     update_existing: bool = False,
     log: Callable[[str], None] = tprint,
 ) -> tuple[bool, str]:
-    """Inject or update teams parameter in workflow files.
-    
-    If update_existing=True, also updates existing teams values to the new value.
-    This makes the operation idempotent - can be re-run to change teams.
-    """
     workflow_files = [
         ".github/workflows/veracode-sandbox-scan.yml",
         ".github/workflows/veracode-policy-scan.yml",
@@ -883,17 +912,15 @@ def inject_teams_into_workflows(
         raw_content = b64decode(file_data.get("content", "")).decode("utf-8")
 
         try:
-            # First try to inject teams where missing
             new_content, was_injected = _inject_teams_regex(raw_content, teams_value)
-            
-            # If update_existing is True, also update any existing teams values
+
             was_updated = False
             if update_existing:
                 new_content, was_updated = _update_teams_value(new_content, teams_value)
-            
+
             if not was_injected and not was_updated:
                 continue
-                
+
         except Exception as exc:
             log(f"  [{org}] Regex injection error for {workflow_path}: {exc}")
             continue
@@ -929,7 +956,6 @@ def _put_veracode_yml_with_backup(
     yml_content: str,
     update_message: str = "Update veracode.yml with new configuration",
 ) -> tuple[bool, str]:
-    """Shared backup-and-update logic used by both inject and update paths."""
     veracode_url = f"{api_base}/repos/{org}/{repo}/contents/veracode.yml"
     default_veracode_url = f"{api_base}/repos/{org}/{repo}/contents/default-veracode.yml"
 
@@ -969,11 +995,6 @@ def _put_veracode_yml_with_backup(
 
 
 def fetch_upstream_veracode_yml() -> str | None:
-    """Fetch veracode.yml from the upstream integration repo with retry on 5xx.
-
-    Returns the file content as a string, or None if all attempts fail.
-    All failure paths are logged; the final failure is logged as an error.
-    """
     url = (
         f"https://raw.githubusercontent.com/"
         f"{INTEGRATION_SOURCE_URL.removeprefix('https://github.com/').removesuffix('.git')}"
@@ -1002,11 +1023,6 @@ def inject_veracode_yml(
     api_base: str, org: str, repo: str, token: str, yml_content: str | None,
     log: Callable[[str], None] = tprint,
 ) -> tuple[bool, str]:
-    """Write the onboarding veracode.yml into the integration repo.
-
-    yml_content is the template read at startup; if it is None the template
-    was not found next to the script and injection is skipped gracefully.
-    """
     if yml_content is None:
         log(f"  [{org}] Warning: veracode.yml not found next to script, skipping injection")
         return False, "template_not_found"
@@ -1025,9 +1041,6 @@ def update_veracode_yml_in_repo(
     repo_is_known_present: bool = False,
     log: Callable[[str], None] = tprint,
 ) -> tuple[bool, str]:
-    """Push yml_content to org/repo.
-    Accepts repo_is_known_present to skip redundant repo_exists/repo_is_empty calls.
-    """
     if not repo_is_known_present:
         if not repo_exists(api_base, org, repo, token):
             log(f"  [{org}] Skipping veracode.yml update - repo '{repo}' not found")
@@ -1040,8 +1053,6 @@ def update_veracode_yml_in_repo(
 
 # ---------------------------------------------------------------------------
 # Org discovery
-# When --enterprise and --orgs-file are both provided, enterprise orgs are
-# fetched via GraphQL and the file-based filter is applied by the caller (main).
 # ---------------------------------------------------------------------------
 
 def list_orgs_graphql(api_base: str, token: str, enterprise: str) -> list[str] | None:
@@ -1085,10 +1096,6 @@ def list_orgs_graphql(api_base: str, token: str, enterprise: str) -> list[str] |
 
 
 def list_orgs(api_base: str, token: str, enterprise: str | None, orgs_file: str | None) -> list[str]:
-    """Discover the org list from enterprise GraphQL, a file, or /user/orgs.
-    When --enterprise and --orgs-file are both provided, enterprise orgs are fetched here
-    and the file-based filter is applied by the caller.
-    """
     errors: list[str] = []
 
     if enterprise:
@@ -1205,15 +1212,6 @@ def wait_for_main_branch(
     poll_interval: int = 10,
     log: Callable[[str], None] = tprint,
 ) -> bool:
-    """Poll until the main branch is visible via the API or timeout is reached.
-
-    GitHub processes a mirror push asynchronously - the branch becomes visible
-    some time after `git push --mirror` returns success. On large repos or under
-    load this can take 30-90 seconds or more.
-
-    Polls every `poll_interval` seconds for up to `timeout` seconds (default 15
-    minutes). Returns True if the branch appears, False if the timeout expires.
-    """
     deadline = time.time() + timeout
     attempt = 0
     while time.time() < deadline:
@@ -1241,20 +1239,11 @@ def ensure_veracode_repo_imported(
     cached_clone_dir: str | None = None,
     log: Callable[[str], None] = tprint,
 ) -> tuple[bool, dict[str, Any]]:
-    """Ensure the Veracode integration repo exists and is populated in org.
-
-    Returns (repo_ok, details). details contains status fields and, on success,
-    an internal '_repo_confirmed_present' key that callers pop to skip redundant
-    existence checks for downstream operations.
-    
-    NOTE: Teams injection is handled separately in process_org for idempotency.
-    """
     details: dict[str, Any] = {"repo": INTEGRATION_REPO_NAME}
     exists = repo_exists(api_base, org, INTEGRATION_REPO_NAME, token)
     is_empty = exists and repo_is_empty(api_base, org, INTEGRATION_REPO_NAME, token)
 
     def _run_post_import_steps() -> None:
-        """Run post-import steps (veracode.yml injection only, teams handled separately)."""
         default_yml_url = f"{api_base}/repos/{org}/{INTEGRATION_REPO_NAME}/contents/default-veracode.yml"
         if request("GET", default_yml_url, token).status_code == 200:
             return
@@ -1320,12 +1309,6 @@ def ensure_veracode_repo_imported(
 # ---------------------------------------------------------------------------
 
 def list_org_installations(api_base: str, org: str, token: str) -> list[dict[str, Any]]:
-    """Return all installed GitHub Apps for org.
-
-    Requests page size 100 (the API maximum) to avoid truncation for orgs with
-    many installed apps. Pagination beyond 100 is not handled here but is
-    extremely rare in practice.
-    """
     r = request("GET", f"{api_base}/orgs/{org}/installations", token,
                 params={"per_page": 100})
     if r.status_code >= 400:
@@ -1436,7 +1419,6 @@ def validate_credentials(
 # ---------------------------------------------------------------------------
 
 def load_teams_map(teams_file: str) -> dict[str, str]:
-    """Raises OSError/csv.Error on failure; caller handles sys.exit."""
     teams_map: dict[str, str] = {}
     with open(teams_file, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -1460,14 +1442,10 @@ def process_org(
     cached_clone_dir: str | None = None,
     buf: OrgBuffer | None = None,
 ) -> None:
-    # In sequential mode buf is None - create a flush_on_add buffer so behaviour
-    # is identical to before (lines stream immediately via tprint).
     if buf is None:
         buf = OrgBuffer(org, org_idx, ctx.total_orgs, flush_on_add=True)
 
     progress_pct = (org_idx / ctx.total_orgs) * 100 if ctx.total_orgs else 100.0
-    # Sequential mode: print the header line immediately as before.
-    # Parallel mode: header is prepended by OrgBuffer.flush().
     if buf.flush_on_add:
         buf.add(f"\n[{org_idx}/{ctx.total_orgs} ({progress_pct:.1f}%)] Processing: {org}")
 
@@ -1478,8 +1456,7 @@ def process_org(
         "timestamp_readable": now.strftime("%Y-%m-%d %H:%M:%S %A"),
     }
 
-    # teams_value resolved once from ctx so it is available throughout this function
-    if ctx.do_set_teams:
+    if ctx.do_set_teams or ctx.do_create_teams:
         if ctx.teams_mode == "auto":
             teams_value: str | None = org
         elif ctx.teams_mode == "hybrid":
@@ -1521,11 +1498,36 @@ def process_org(
             ctx.stats.repo_fail += 1
         buf.add(f"  Repo error: {str(exc)[:80]}")
 
+    # --- Veracode platform team creation (Identity API) -----------------------
+    if ctx.do_create_teams and teams_value and ctx.veracode_api_id and ctx.veracode_api_key:
+        try:
+            team_id, team_action = ensure_veracode_team(
+                teams_value, ctx.veracode_api_id, ctx.veracode_api_key, log=buf.add,
+            )
+            entry["veracode_team_platform"] = {
+                "team_name": teams_value,
+                "team_id": team_id,
+                "action": team_action,
+            }
+            with ctx.stats_lock:
+                if team_action == "created":
+                    ctx.stats.teams_created_on_platform += 1
+                elif team_action == "already_exists":
+                    ctx.stats.teams_already_exist_on_platform += 1
+                else:
+                    ctx.stats.teams_create_failed_on_platform += 1
+        except Exception as exc:
+            entry["veracode_team_platform"] = {
+                "team_name": teams_value,
+                "team_id": None,
+                "action": f"error:{exc}",
+            }
+            with ctx.stats_lock:
+                ctx.stats.teams_create_failed_on_platform += 1
+            buf.add(f"  Platform team creation error: {str(exc)[:80]}")
+
     # --- Teams injection (independent, idempotent) ----------------------------
-    # Runs whenever --set-teams-* flag is set, regardless of repo import status.
-    # Updates existing teams values to ensure idempotency.
     if ctx.do_set_teams and teams_value:
-        # Check if repo exists and is not empty before attempting teams injection
         try:
             if repo_confirmed_present or (
                 repo_exists(ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token) and
@@ -1533,7 +1535,7 @@ def process_org(
             ):
                 teams_ok, teams_msg = inject_teams_into_workflows(
                     ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token, teams_value,
-                    update_existing=True,  # Enable idempotent updates
+                    update_existing=True,
                     log=buf.add,
                 )
                 entry["teams_injection"] = {"success": teams_ok, "action": teams_msg, "value": teams_value}
@@ -1662,16 +1664,13 @@ def process_org(
                     ctx.stats.secrets_checked += 1
             buf.add(f"  Secrets error: {str(exc)[:80]}")
 
-    # --- Write report + checkpoint (checkpoint saved AFTER all work completes) ---
+    # --- Write report + checkpoint --------------------------------------------
     with ctx.report_lock:
         append_report_entry(ctx.report_path, entry)
 
-    # processed reflects orgs that have fully completed all work.
     with ctx.stats_lock:
         ctx.stats.processed += 1
 
-    # use len(ctx.completed_orgs) inside checkpoint_lock for the completion count -
-    # avoids reading ctx.stats.processed across two different locks.
     with ctx.checkpoint_lock:
         ctx.completed_orgs.append(org)
         try:
@@ -1706,6 +1705,13 @@ def process_org(
         elif not teams_value:
             teams_detail = " Teams: (no teams configured)"
 
+    platform_team_detail = ""
+    if ctx.do_create_teams:
+        pt_info = entry.get("veracode_team_platform", {})
+        if pt_info:
+            pt_action = pt_info.get("action", "")
+            platform_team_detail = f" PlatformTeam: [{pt_action}]"
+
     yml_status = ""
     if ctx.do_update_yml:
         yml_info = entry.get("veracode_yml_update", {})
@@ -1733,9 +1739,7 @@ def process_org(
         else:
             secrets_status = "  Secrets: [FAIL]"
 
-    buf.add(f"  Repo: {repo_status}{teams_detail}  App: {app_status}{yml_status}{secrets_status}")
-    # buf.flush() is called by the caller (as_completed loop in parallel mode,
-    # or directly below in sequential mode) so the slot clear and flush happen atomically.
+    buf.add(f"  Repo: {repo_status}{teams_detail}{platform_team_detail}  App: {app_status}{yml_status}{secrets_status}")
 
 
 # ---------------------------------------------------------------------------
@@ -1763,6 +1767,12 @@ def main() -> None:
                     help="[apply] Prepend PREFIX to every injected teams value. "
                          "Applied after --set-teams-auto/file/hybrid resolution. "
                          "Example: --team-prefix 'gh-' turns 'acme-dev' into 'gh-acme-dev'.")
+
+    ap.add_argument("--create-teams", action="store_true",
+                    help="[apply] Create teams on the Veracode platform (Identity API) if they "
+                         "do not already exist. Uses the resolved teams value from "
+                         "--set-teams-auto/file/hybrid. Requires VERACODE_API_ID and "
+                         "VERACODE_API_KEY env vars (human user account with Administrator role).")
 
     ap.add_argument("--set-secrets", action="store_true",
                     help="[apply] Set VERACODE_API_ID, VERACODE_API_KEY, VERACODE_AGENT_TOKEN. "
@@ -1827,8 +1837,8 @@ def main() -> None:
     do_set_secrets = bool(args.apply and args.set_secrets)
     do_set_teams = bool(args.apply and (args.set_teams_auto or args.set_teams_file or args.set_teams_hybrid))
     do_update_yml = bool(args.apply and args.update_veracode_yml is not None)
+    do_create_teams = bool(args.apply and args.create_teams and (args.set_teams_auto or args.set_teams_file or args.set_teams_hybrid))
 
-    # Derive teams_mode string once here so workers receive a clean Literal value.
     if args.set_teams_auto:
         teams_mode = "auto"
     elif args.set_teams_hybrid:
@@ -1838,8 +1848,6 @@ def main() -> None:
     else:
         teams_mode = "none"
 
-    # Read the onboarding template once at startup; pass through RunContext.
-    # Pre-clone runs for both sequential and parallel paths when do_apply_repo is True.
     onboarding_yml_content: str | None = None
     onboarding_yml_path: Path | None = None
     if do_apply_repo:
@@ -1873,8 +1881,9 @@ def main() -> None:
             yml_source_label = INTEGRATION_SOURCE_URL
         print(f"[update-veracode-yml] Source: {yml_source_label}")
 
-    veracode_api_id = env("VERACODE_API_ID") if do_set_secrets else None
-    veracode_api_key = env("VERACODE_API_KEY") if do_set_secrets else None
+    need_veracode_creds = do_set_secrets or do_create_teams
+    veracode_api_id = env("VERACODE_API_ID") if need_veracode_creds else None
+    veracode_api_key = env("VERACODE_API_KEY") if need_veracode_creds else None
     veracode_sa_api_id = env("VERACODE_SA_API_ID") if do_set_secrets else None
     veracode_sa_api_key = env("VERACODE_SA_API_KEY") if do_set_secrets else None
 
@@ -1883,6 +1892,10 @@ def main() -> None:
         sys.exit(1)
     if do_set_secrets and (not veracode_sa_api_id or not veracode_sa_api_key):
         print("ERROR: --set-secrets requires VERACODE_SA_API_ID and VERACODE_SA_API_KEY env vars.", file=sys.stderr)
+        sys.exit(1)
+    if do_create_teams and (not veracode_api_id or not veracode_api_key):
+        print("ERROR: --create-teams requires VERACODE_API_ID and VERACODE_API_KEY env vars "
+              "(human user account with Administrator role).", file=sys.stderr)
         sys.exit(1)
 
     teams_map: dict[str, str] = {}
@@ -1913,6 +1926,10 @@ def main() -> None:
                 print(f"    Team prefix         : '{args.team_prefix}'")
         else:
             print("  Set teams in workflows: NO (--set-teams-auto or --set-teams-file or --set-teams-hybrid)")
+        if do_create_teams:
+            print("  Create platform teams : YES (via Veracode Identity API)")
+        else:
+            print("  Create platform teams : NO (--create-teams)")
         if do_update_yml:
             print(f"  Update veracode.yml   : YES (source: {yml_source_label})")
         print(f"  Set Veracode secrets  : {'YES' if do_set_secrets else 'NO (--set-secrets)'}")
@@ -1931,8 +1948,6 @@ def main() -> None:
 
     all_orgs = list_orgs(api_base, token, args.enterprise, args.orgs_file)
 
-    # When --enterprise and --orgs-file are both provided, filter the enterprise
-    # org list down to only the orgs named in the file.
     if args.orgs_file and args.enterprise:
         try:
             with open(args.orgs_file, encoding="utf-8") as f:
@@ -1959,7 +1974,7 @@ def main() -> None:
         token=token,
         veracode_api_id=veracode_api_id,
         veracode_api_key=veracode_api_key,
-        check_veracode=do_set_secrets,
+        check_veracode=do_set_secrets or do_create_teams,
     )
     if not validation_ok:
         print("\n[ERROR] Credential validation failed:", file=sys.stderr)
@@ -2009,6 +2024,8 @@ def main() -> None:
         print("Actions enabled:")
         if do_apply_repo:
             print("  - Create and import veracode repos")
+        if do_create_teams:
+            print("  - Create teams on Veracode platform via Identity API")
         if do_set_teams:
             print("  - Inject/update teams parameters into workflows")
         if do_update_yml:
@@ -2032,6 +2049,7 @@ def main() -> None:
         do_set_secrets=do_set_secrets,
         do_set_teams=do_set_teams,
         do_update_yml=do_update_yml,
+        do_create_teams=do_create_teams,
         dry_run=args.dry_run,
         teams_mode=teams_mode,
         yml_content=yml_content,
@@ -2050,7 +2068,6 @@ def main() -> None:
 
     workers = args.workers
 
-    # Pre-clone the integration repo once; workers copy it rather than each cloning independently.
     _cached_clone_dir: str | None = None
     if do_apply_repo and check_git_available():
         label = "[PARALLEL]" if workers > 1 else "[import-repo]"
@@ -2067,8 +2084,6 @@ def main() -> None:
             print(f"[PARALLEL] Running with {workers} workers\n")
             progress = ProgressDisplay(workers)
 
-            # Semaphore-based slot pool: a slot is only assigned when a worker
-            # actually starts executing, not when the future is submitted to the queue.
             _slot_sem = threading.Semaphore(workers)
             _slot_pool = list(range(workers))
             _slot_lock = threading.Lock()
@@ -2086,7 +2101,6 @@ def main() -> None:
             def _process_org_with_slot(
                 org: str, idx: int, org_buf: OrgBuffer
             ) -> OrgBuffer:
-                """Wrapper that acquires/releases a display slot around process_org."""
                 slot_id = _acquire_slot()
                 org_buf._slot_id = slot_id  # type: ignore[attr-defined]
                 progress.start(org, idx, total_orgs)
@@ -2111,8 +2125,6 @@ def main() -> None:
                             future.result()
                         except Exception as exc:
                             tprint(f"[ERROR] Unhandled exception for org {org_name}: {exc}")
-                        # Flush the org's buffered output and clear the display slot
-                        # in one _print_lock acquisition - no interleaving possible.
                         if slot_id is not None:
                             org_buf.flush_then_clear(progress, slot_id)
                         else:
@@ -2126,7 +2138,6 @@ def main() -> None:
         if _cached_clone_dir and os.path.exists(_cached_clone_dir):
             shutil.rmtree(_cached_clone_dir, ignore_errors=True)
 
-    # Convert JSONL -> pretty JSON array
     finalize_report(report_path)
 
     write_csv(outdir / "missing_veracode_repo.csv", ["organization", "repo_name", "note"], ctx.missing_repo_rows)
@@ -2159,7 +2170,12 @@ def main() -> None:
     if app_total > 0:
         print(f"Workflow App    : {st.app_installed} installed, {st.app_missing} missing (see manual_install_links.csv)")
 
-    # Teams stats (only show when teams flag was used)
+    if do_create_teams:
+        pt_total = st.teams_created_on_platform + st.teams_already_exist_on_platform + st.teams_create_failed_on_platform
+        print(f"Platform Teams  : {st.teams_created_on_platform} created, "
+              f"{st.teams_already_exist_on_platform} already exist, "
+              f"{st.teams_create_failed_on_platform} failed (of {pt_total} orgs)")
+
     if do_set_teams:
         teams_total = st.teams_updated + st.teams_skipped + st.teams_failed
         print(f"Teams Injection : {st.teams_updated} updated, {st.teams_skipped} already current/skipped, {st.teams_failed} failed (of {teams_total} orgs)")
