@@ -150,6 +150,12 @@ class RunStats:
     teams_created_on_platform: int = 0
     teams_already_exist_on_platform: int = 0
     teams_create_failed_on_platform: int = 0
+    default_branch_fixed: int = 0
+    default_branch_ok: int = 0
+    default_branch_failed: int = 0
+    fix_repos_checked: int = 0
+    fix_repos_remediated: int = 0
+    fix_repos_skipped: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +172,7 @@ class RunContext:
     do_set_teams: bool
     do_update_yml: bool
     do_create_teams: bool
+    do_fix_repos: bool
     dry_run: bool
     teams_mode: Literal["auto", "file", "hybrid", "none"]
     yml_content: str | None
@@ -636,7 +643,6 @@ def _find_veracode_team_by_name(
     api_key: str,
     log: Callable[[str], None] = tprint,
 ) -> str | None:
-    """Page through all org teams until exact name match; returns team_id (UUID) or None."""
     page = 0
     while True:
         r = veracode_request(
@@ -676,7 +682,6 @@ def create_veracode_team(
     api_key: str,
     log: Callable[[str], None] = tprint,
 ) -> str | None:
-    """Create a team on the Veracode platform via Identity API. Returns team_id (UUID) or None."""
     try:
         r = veracode_request(
             "POST", "/api/authn/v2/teams", api_id, api_key,
@@ -712,11 +717,6 @@ def ensure_veracode_team(
     api_key: str,
     log: Callable[[str], None] = tprint,
 ) -> tuple[str | None, str]:
-    """Find or create a Veracode platform team by name.
-
-    Returns (team_id, action) where action is one of:
-    'already_exists', 'created', 'error'.
-    """
     existing_id = _find_veracode_team_by_name(team_name, api_id, api_key, log)
     if existing_id:
         return existing_id, "already_exists"
@@ -848,6 +848,177 @@ def set_veracode_secrets(
 
     all_ok = all(v.startswith("set") for v in results.values())
     return all_ok, results
+
+
+# ---------------------------------------------------------------------------
+# Default branch helpers
+# ---------------------------------------------------------------------------
+
+def get_repo_default_branch(api_base: str, org: str, repo: str, token: str) -> str | None:
+    """Return the current default branch name, or None on error."""
+    try:
+        r = request("GET", f"{api_base}/repos/{org}/{repo}", token)
+        if r.status_code == 200:
+            return r.json().get("default_branch")
+        return None
+    except Exception:
+        return None
+
+
+def set_default_branch(
+    api_base: str,
+    org: str,
+    repo: str,
+    token: str,
+    branch: str = "main",
+    log: Callable[[str], None] = tprint,
+) -> tuple[bool, str]:
+    """
+    Set the default branch for a repo.
+    Returns (success, action) where action is one of:
+    'already_main', 'set_to_main', 'branch_not_found', 'failed'.
+    """
+    current = get_repo_default_branch(api_base, org, repo, token)
+    if current is None:
+        log(f"  [{org}] Could not read default_branch for {repo}")
+        return False, "failed"
+
+    if current == branch:
+        return True, "already_main"
+
+    r = request("PATCH", f"{api_base}/repos/{org}/{repo}", token, json={"default_branch": branch})
+    if r.status_code == 200:
+        log(f"  [{org}] Default branch changed: {current!r} -> {branch!r}")
+        return True, "set_to_main"
+
+    if r.status_code == 422:
+        body = r.json()
+        msg = str(body).lower()
+        if "does not exist" in msg or "not found" in msg or "invalid" in msg:
+            log(f"  [{org}] Branch '{branch}' does not exist in {repo} - cannot set as default")
+            return False, "branch_not_found"
+
+    log(f"  [{org}] PATCH default_branch failed: {r.status_code} - {r.text[:200]}")
+    return False, "failed"
+
+
+def check_and_fix_default_branch(
+    api_base: str,
+    org: str,
+    repo: str,
+    token: str,
+    dry_run: bool = False,
+    log: Callable[[str], None] = tprint,
+) -> tuple[bool, str]:
+    """
+    Check if default branch is 'main'; fix it if not (unless dry_run).
+    Returns (is_main, action).
+    """
+    current = get_repo_default_branch(api_base, org, repo, token)
+    if current is None:
+        return False, "read_failed"
+    if current == "main":
+        return True, "already_main"
+    if dry_run:
+        log(f"  [{org}] Default branch is '{current}' (not 'main') - would fix in apply mode")
+        return False, f"needs_fix:{current}"
+    return set_default_branch(api_base, org, repo, token, "main", log)
+
+
+# ---------------------------------------------------------------------------
+# Repo health check for --fix-repos
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RepoHealthResult:
+    org: str
+    repo_exists: bool = False
+    repo_empty: bool = False
+    default_branch: str | None = None
+    default_branch_ok: bool = False
+    default_branch_action: str = "not_checked"
+    veracode_yml_present: bool = False
+    veracode_yml_action: str = "not_checked"
+    teams_action: str = "not_checked"
+    needs_remediation: bool = False
+
+
+def check_repo_health(
+    api_base: str,
+    org: str,
+    repo: str,
+    token: str,
+    yml_content: str | None,
+    teams_value: str | None,
+    onboarding_yml_content: str | None,
+    dry_run: bool,
+    log: Callable[[str], None] = tprint,
+) -> RepoHealthResult:
+    result = RepoHealthResult(org=org)
+
+    if not repo_exists(api_base, org, repo, token):
+        log(f"  [{org}] Repo '{repo}' does not exist - skipping health check")
+        return result
+
+    result.repo_exists = True
+
+    if repo_is_empty(api_base, org, repo, token):
+        result.repo_empty = True
+        log(f"  [{org}] Repo '{repo}' exists but is empty - skipping health checks")
+        return result
+
+    # --- Default branch -------------------------------------------------------
+    db_ok, db_action = check_and_fix_default_branch(api_base, org, repo, token, dry_run, log)
+    result.default_branch = get_repo_default_branch(api_base, org, repo, token)
+    result.default_branch_ok = db_ok
+    result.default_branch_action = db_action
+    if not db_ok:
+        result.needs_remediation = True
+
+    # --- veracode.yml presence ------------------------------------------------
+    yml_url = f"{api_base}/repos/{org}/{repo}/contents/veracode.yml"
+    r = request("GET", yml_url, token)
+    result.veracode_yml_present = r.status_code == 200
+
+    effective_yml = yml_content or onboarding_yml_content
+    if not result.veracode_yml_present and effective_yml:
+        result.needs_remediation = True
+        if not dry_run:
+            yml_ok, yml_action = _put_veracode_yml_with_backup(
+                api_base, org, repo, token, effective_yml,
+                update_message="Add missing veracode.yml during fix-repos remediation",
+            )
+            result.veracode_yml_action = yml_action if yml_ok else f"failed:{yml_action}"
+            log(f"  [{org}] veracode.yml: {result.veracode_yml_action}")
+        else:
+            result.veracode_yml_action = "missing_would_add"
+            log(f"  [{org}] veracode.yml missing - would add in apply mode")
+    elif result.veracode_yml_present and yml_content and not dry_run:
+        yml_ok, yml_action = _put_veracode_yml_with_backup(
+            api_base, org, repo, token, yml_content,
+            update_message="Update veracode.yml during fix-repos remediation",
+        )
+        result.veracode_yml_action = yml_action if yml_ok else f"failed:{yml_action}"
+    else:
+        result.veracode_yml_action = "present_no_update" if result.veracode_yml_present else "missing_no_template"
+
+    # --- Teams injection -------------------------------------------------------
+    if teams_value:
+        if not dry_run:
+            teams_ok, teams_msg = inject_teams_into_workflows(
+                api_base, org, repo, token, teams_value,
+                update_existing=True,
+                log=log,
+            )
+            result.teams_action = teams_msg
+            if not teams_ok and teams_msg not in ("no_workflow_files_found", "teams_already_current"):
+                result.needs_remediation = True
+        else:
+            result.teams_action = "would_check_teams"
+    else:
+        result.teams_action = "no_teams_configured"
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1244,6 +1415,12 @@ def ensure_veracode_repo_imported(
     is_empty = exists and repo_is_empty(api_base, org, INTEGRATION_REPO_NAME, token)
 
     def _run_post_import_steps() -> None:
+        # Ensure default branch is 'main' before any content operations
+        db_ok, db_action = set_default_branch(api_base, org, INTEGRATION_REPO_NAME, token, "main", log)
+        details["default_branch_action"] = db_action
+        if not db_ok and db_action != "already_main":
+            log(f"  [{org}] Warning: could not set default branch to main ({db_action})")
+
         default_yml_url = f"{api_base}/repos/{org}/{INTEGRATION_REPO_NAME}/contents/default-veracode.yml"
         if request("GET", default_yml_url, token).status_code == 200:
             return
@@ -1468,35 +1645,87 @@ def process_org(
     else:
         teams_value = None
 
+    # --- Fix existing repos (compensatory pass) -------------------------------
+    if ctx.do_fix_repos:
+        try:
+            fix_teams_value: str | None = None
+            if ctx.teams_mode != "none":
+                if ctx.teams_mode == "auto":
+                    fix_teams_value = org
+                elif ctx.teams_mode == "hybrid":
+                    fix_teams_value = ctx.teams_map.get(org, "").strip() or org
+                else:
+                    fix_teams_value = ctx.teams_map.get(org, "").strip() or None
+                if fix_teams_value and ctx.team_prefix:
+                    fix_teams_value = ctx.team_prefix + fix_teams_value
+
+            health = check_repo_health(
+                ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token,
+                yml_content=ctx.yml_content,
+                teams_value=fix_teams_value,
+                onboarding_yml_content=ctx.onboarding_yml_content,
+                dry_run=ctx.dry_run,
+                log=buf.add,
+            )
+            entry["fix_repos"] = {
+                "repo_exists": health.repo_exists,
+                "repo_empty": health.repo_empty,
+                "default_branch": health.default_branch,
+                "default_branch_ok": health.default_branch_ok,
+                "default_branch_action": health.default_branch_action,
+                "veracode_yml_present": health.veracode_yml_present,
+                "veracode_yml_action": health.veracode_yml_action,
+                "teams_action": health.teams_action,
+                "needs_remediation": health.needs_remediation,
+            }
+            with ctx.stats_lock:
+                ctx.stats.fix_repos_checked += 1
+                if not health.repo_exists or health.repo_empty:
+                    ctx.stats.fix_repos_skipped += 1
+                elif health.needs_remediation:
+                    ctx.stats.fix_repos_remediated += 1
+                if health.default_branch_action == "already_main":
+                    ctx.stats.default_branch_ok += 1
+                elif health.default_branch_action == "set_to_main":
+                    ctx.stats.default_branch_fixed += 1
+                elif health.default_branch_action not in ("not_checked", "read_failed"):
+                    ctx.stats.default_branch_failed += 1
+        except Exception as exc:
+            entry["fix_repos"] = {"error": str(exc)}
+            with ctx.stats_lock:
+                ctx.stats.fix_repos_checked += 1
+            buf.add(f"  Fix-repos error: {str(exc)[:80]}")
+
     # --- Repo import ----------------------------------------------------------
     repo_confirmed_present = False
-    try:
-        repo_ok, repo_details = ensure_veracode_repo_imported(
-            ctx.api_base, org, ctx.token,
-            do_apply=ctx.do_apply_repo,
-            onboarding_yml_content=ctx.onboarding_yml_content,
-            auto_import=ctx.do_apply_repo,
-            web_base=ctx.web_base,
-            cached_clone_dir=cached_clone_dir,
-            log=buf.add,
-        )
-        repo_confirmed_present = repo_details.pop("_repo_confirmed_present", False)
-        entry["veracode_repo"] = {"present": repo_ok, **repo_details}
-        with ctx.stats_lock:
-            if repo_ok:
-                ctx.stats.repo_success += 1
-            else:
-                ctx.stats.repo_fail += 1
-        if not repo_ok:
+    if not ctx.do_fix_repos:
+        try:
+            repo_ok, repo_details = ensure_veracode_repo_imported(
+                ctx.api_base, org, ctx.token,
+                do_apply=ctx.do_apply_repo,
+                onboarding_yml_content=ctx.onboarding_yml_content,
+                auto_import=ctx.do_apply_repo,
+                web_base=ctx.web_base,
+                cached_clone_dir=cached_clone_dir,
+                log=buf.add,
+            )
+            repo_confirmed_present = repo_details.pop("_repo_confirmed_present", False)
+            entry["veracode_repo"] = {"present": repo_ok, **repo_details}
+            with ctx.stats_lock:
+                if repo_ok:
+                    ctx.stats.repo_success += 1
+                else:
+                    ctx.stats.repo_fail += 1
+            if not repo_ok:
+                with ctx.rows_lock:
+                    ctx.missing_repo_rows.append([org, INTEGRATION_REPO_NAME, repo_details.get("status", "missing")])
+        except Exception as exc:
+            entry["veracode_repo"] = {"present": None, "status": "error", "error": str(exc)}
             with ctx.rows_lock:
-                ctx.missing_repo_rows.append([org, INTEGRATION_REPO_NAME, repo_details.get("status", "missing")])
-    except Exception as exc:
-        entry["veracode_repo"] = {"present": None, "status": "error", "error": str(exc)}
-        with ctx.rows_lock:
-            ctx.missing_repo_rows.append([org, INTEGRATION_REPO_NAME, f"error:{exc}"])
-        with ctx.stats_lock:
-            ctx.stats.repo_fail += 1
-        buf.add(f"  Repo error: {str(exc)[:80]}")
+                ctx.missing_repo_rows.append([org, INTEGRATION_REPO_NAME, f"error:{exc}"])
+            with ctx.stats_lock:
+                ctx.stats.repo_fail += 1
+            buf.add(f"  Repo error: {str(exc)[:80]}")
 
     # --- Veracode platform team creation (Identity API) -----------------------
     if ctx.do_create_teams and teams_value and ctx.veracode_api_id and ctx.veracode_api_key:
@@ -1527,7 +1756,7 @@ def process_org(
             buf.add(f"  Platform team creation error: {str(exc)[:80]}")
 
     # --- Teams injection (independent, idempotent) ----------------------------
-    if ctx.do_set_teams and teams_value:
+    if ctx.do_set_teams and teams_value and not ctx.do_fix_repos:
         try:
             if repo_confirmed_present or (
                 repo_exists(ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token) and
@@ -1579,7 +1808,7 @@ def process_org(
         buf.add(f"  App check error: {str(exc)[:80]}")
 
     # --- veracode.yml update --------------------------------------------------
-    if ctx.do_update_yml and ctx.yml_content:
+    if ctx.do_update_yml and ctx.yml_content and not ctx.do_fix_repos:
         try:
             yml_ok, yml_action = update_veracode_yml_in_repo(
                 ctx.api_base, org, INTEGRATION_REPO_NAME, ctx.token, ctx.yml_content,
@@ -1690,6 +1919,18 @@ def process_org(
             buf.add(f"  [WARNING] Failed to save checkpoint: {exc}")
 
     # --- Console summary line -------------------------------------------------
+    if ctx.do_fix_repos:
+        fix_info = entry.get("fix_repos", {})
+        db_action = fix_info.get("default_branch_action", "?")
+        yml_action = fix_info.get("veracode_yml_action", "?")
+        teams_action = fix_info.get("teams_action", "?")
+        app_status = "[OK]" if entry.get("workflow_app", {}).get("installed") else "[FAIL]"
+        buf.add(
+            f"  DefaultBranch: [{db_action}]  YML: [{yml_action}]  "
+            f"Teams: [{teams_action}]  App: {app_status}"
+        )
+        return
+
     repo_status = "[OK]" if entry.get("veracode_repo", {}).get("present") else "[FAIL]"
     app_status = "[OK]" if entry.get("workflow_app", {}).get("installed") else "[FAIL]"
 
@@ -1764,15 +2005,11 @@ def main() -> None:
                              help="[apply] CSV file (org,teams); orgs with blank teams fall back to org name.")
 
     ap.add_argument("--team-prefix", default="", metavar="PREFIX",
-                    help="[apply] Prepend PREFIX to every injected teams value. "
-                         "Applied after --set-teams-auto/file/hybrid resolution. "
-                         "Example: --team-prefix 'gh-' turns 'acme-dev' into 'gh-acme-dev'.")
+                    help="[apply] Prepend PREFIX to every injected teams value.")
 
     ap.add_argument("--create-teams", action="store_true",
                     help="[apply] Create teams on the Veracode platform (Identity API) if they "
-                         "do not already exist. Uses the resolved teams value from "
-                         "--set-teams-auto/file/hybrid. Requires VERACODE_API_ID and "
-                         "VERACODE_API_KEY env vars (human user account with Administrator role).")
+                         "do not already exist. Requires VERACODE_API_ID and VERACODE_API_KEY.")
 
     ap.add_argument("--set-secrets", action="store_true",
                     help="[apply] Set VERACODE_API_ID, VERACODE_API_KEY, VERACODE_AGENT_TOKEN. "
@@ -1782,10 +2019,22 @@ def main() -> None:
         "--update-veracode-yml", metavar="FILE", nargs="?", const="",
         help=(
             "[apply] Push a veracode.yml to the 'veracode' repo in every org, overwriting the "
-            "current file. Omit FILE to fetch from the upstream integration repo; pass a local "
-            "FILE path to use a custom file instead. The current file is backed up as "
-            "default-veracode.yml before overwriting. Orgs with a missing or not-yet-imported "
-            "repo are skipped."
+            "current file. Omit FILE to fetch from upstream; pass a local FILE path for custom. "
+            "The current file is backed up as default-veracode.yml before overwriting."
+        ),
+    )
+
+    ap.add_argument(
+        "--fix-repos", action="store_true",
+        help=(
+            "[apply|dry-run] Compensatory pass for already-imported repos. For each org, checks "
+            "that the 'veracode' repo: (1) has 'main' as its default branch and fixes it if not, "
+            "(2) has veracode.yml present and adds/updates it if missing (uses --update-veracode-yml "
+            "FILE if supplied, otherwise falls back to the local veracode.yml next to this script), "
+            "(3) has teams injected into workflow files if a teams mode is active. "
+            "Skips orgs where the repo does not exist or is empty. "
+            "Compatible with --dry-run to audit without making changes. "
+            "Mutually exclusive with --import-repo during a single run."
         ),
     )
 
@@ -1802,9 +2051,7 @@ def main() -> None:
     ap.add_argument("--continue", dest="resume", action="store_true",
                     help="Resume from the last checkpoint saved in checkpoint.json.")
     ap.add_argument("--workers", type=int, default=1, metavar="N",
-                    help="Number of parallel worker threads (default: 1). Recommended: 3-5. "
-                         "Higher values increase throughput but consume GitHub API rate limit faster. "
-                         "Values above 10 are not recommended.")
+                    help="Number of parallel worker threads (default: 1). Recommended: 3-5.")
 
     args = ap.parse_args()
 
@@ -1817,6 +2064,10 @@ def main() -> None:
 
     if not args.dry_run and not args.apply:
         args.dry_run = True
+
+    if args.fix_repos and args.import_repo:
+        print("ERROR: --fix-repos and --import-repo are mutually exclusive in a single run.", file=sys.stderr)
+        sys.exit(1)
 
     if args.apply and args.set_secrets:
         try:
@@ -1838,6 +2089,7 @@ def main() -> None:
     do_set_teams = bool(args.apply and (args.set_teams_auto or args.set_teams_file or args.set_teams_hybrid))
     do_update_yml = bool(args.apply and args.update_veracode_yml is not None)
     do_create_teams = bool(args.apply and args.create_teams and (args.set_teams_auto or args.set_teams_file or args.set_teams_hybrid))
+    do_fix_repos = bool(args.fix_repos)
 
     if args.set_teams_auto:
         teams_mode = "auto"
@@ -1850,20 +2102,21 @@ def main() -> None:
 
     onboarding_yml_content: str | None = None
     onboarding_yml_path: Path | None = None
-    if do_apply_repo:
+    if do_apply_repo or do_fix_repos:
         onboarding_yml_path = Path(__file__).parent / "veracode.yml"
         if onboarding_yml_path.exists():
             onboarding_yml_content = onboarding_yml_path.read_text(encoding="utf-8")
             print(f"[import-repo] Onboarding veracode.yml: {onboarding_yml_path.resolve()}")
         else:
-            print("[WARNING] veracode.yml not found next to script - repo will be imported but yml injection will be skipped.")
-            print(f"          Expected: {onboarding_yml_path.resolve()}", file=sys.stderr)
+            if do_apply_repo:
+                print("[WARNING] veracode.yml not found next to script - repo will be imported but yml injection will be skipped.")
+                print(f"          Expected: {onboarding_yml_path.resolve()}", file=sys.stderr)
             onboarding_yml_path = None
 
     yml_content: str | None = None
     yml_source_label: str | None = None
-    if do_update_yml:
-        raw_path = args.update_veracode_yml
+    if do_update_yml or do_fix_repos:
+        raw_path = getattr(args, "update_veracode_yml", None)
         if raw_path:
             local_path = Path(raw_path)
             if not local_path.exists():
@@ -1871,7 +2124,7 @@ def main() -> None:
                 sys.exit(1)
             yml_content = local_path.read_text(encoding="utf-8")
             yml_source_label = str(local_path.resolve())
-        else:
+        elif do_update_yml:
             print("[update-veracode-yml] Fetching veracode.yml from upstream integration repo...")
             yml_content = fetch_upstream_veracode_yml()
             if not yml_content:
@@ -1879,7 +2132,8 @@ def main() -> None:
                       "Pass a local file with --update-veracode-yml FILE.", file=sys.stderr)
                 sys.exit(1)
             yml_source_label = INTEGRATION_SOURCE_URL
-        print(f"[update-veracode-yml] Source: {yml_source_label}")
+        if yml_source_label:
+            print(f"[update-veracode-yml] Source: {yml_source_label}")
 
     need_veracode_creds = do_set_secrets or do_create_teams
     veracode_api_id = env("VERACODE_API_ID") if need_veracode_creds else None
@@ -1911,10 +2165,17 @@ def main() -> None:
     print(f"MODE: {'APPLY' if args.apply else 'DRY-RUN'}")
     print(f"{'=' * 60}")
     if args.apply:
-        print(f"  Import missing repos  : {'YES' if do_apply_repo else 'NO (--import-repo)'}")
-        if do_apply_repo:
-            yml_note = str(onboarding_yml_path.resolve()) if onboarding_yml_path else "NOT FOUND - import only, yml injection skipped"
-            print(f"    Onboarding YML      : {yml_note}")
+        if do_fix_repos:
+            print("  Fix existing repos    : YES")
+            print("    - Check/fix default branch to 'main'")
+            print("    - Add/update veracode.yml if missing")
+            if teams_mode != "none":
+                print("    - Inject/update teams in workflow files")
+        else:
+            print(f"  Import missing repos  : {'YES' if do_apply_repo else 'NO (--import-repo)'}")
+            if do_apply_repo:
+                yml_note = str(onboarding_yml_path.resolve()) if onboarding_yml_path else "NOT FOUND - import only, yml injection skipped"
+                print(f"    Onboarding YML      : {yml_note}")
         if do_set_teams:
             if args.set_teams_auto:
                 print("  Set teams in workflows: YES (auto - org name)")
@@ -1924,20 +2185,17 @@ def main() -> None:
                 print(f"  Set teams in workflows: YES (from {args.set_teams_file})")
             if args.team_prefix:
                 print(f"    Team prefix         : '{args.team_prefix}'")
-        else:
-            print("  Set teams in workflows: NO (--set-teams-auto or --set-teams-file or --set-teams-hybrid)")
         if do_create_teams:
             print("  Create platform teams : YES (via Veracode Identity API)")
-        else:
-            print("  Create platform teams : NO (--create-teams)")
         if do_update_yml:
             print(f"  Update veracode.yml   : YES (source: {yml_source_label})")
         print(f"  Set Veracode secrets  : {'YES' if do_set_secrets else 'NO (--set-secrets)'}")
-        if do_set_secrets:
-            print(f"    VERACODE_API_ID     : {'SET' if veracode_api_id else 'NOT SET'}  (admin - for API calls)")
-            print(f"    VERACODE_API_KEY    : {'SET' if veracode_api_key else 'NOT SET'}  (admin - for API calls)")
-            print(f"    VERACODE_SA_API_ID  : {'SET' if veracode_sa_api_id else 'NOT SET'}  (service account - stored in orgs)")
-            print(f"    VERACODE_SA_API_KEY : {'SET' if veracode_sa_api_key else 'NOT SET'}  (service account - stored in orgs)")
+    elif do_fix_repos:
+        print("  Fix existing repos    : DRY-RUN (audit only, no changes)")
+        print("    - Check default branch (report only)")
+        print("    - Check veracode.yml presence (report only)")
+        if teams_mode != "none":
+            print("    - Check teams injection (report only)")
     else:
         print("  No changes will be made (use --apply to enable changes)")
     print(f"  Workers               : {args.workers}{' (parallel)' if args.workers > 1 else ' (sequential)'}")
@@ -2022,6 +2280,11 @@ def main() -> None:
         print(f"{'=' * 60}")
         print(f"About to modify {total_orgs} organizations in APPLY mode.")
         print("Actions enabled:")
+        if do_fix_repos:
+            print("  - Check and fix default branch to 'main' in veracode repos")
+            print("  - Add/update veracode.yml where missing")
+            if teams_mode != "none":
+                print("  - Inject/update teams in workflow files")
         if do_apply_repo:
             print("  - Create and import veracode repos")
         if do_create_teams:
@@ -2050,6 +2313,7 @@ def main() -> None:
         do_set_teams=do_set_teams,
         do_update_yml=do_update_yml,
         do_create_teams=do_create_teams,
+        do_fix_repos=do_fix_repos,
         dry_run=args.dry_run,
         teams_mode=teams_mode,
         yml_content=yml_content,
@@ -2161,10 +2425,17 @@ def main() -> None:
     print(f"Organizations   : {st.processed}/{st.total_orgs} processed")
     print()
 
-    repo_total = st.repo_success + st.repo_fail
-    if repo_total > 0:
-        repo_pct = (st.repo_success / repo_total) * 100
-        print(f"Veracode Repos  : {st.repo_success} success, {st.repo_fail} failed ({repo_pct:.1f}% success)")
+    if do_fix_repos:
+        fix_total = st.fix_repos_checked
+        print(f"Fix-Repos       : {fix_total} checked, {st.fix_repos_remediated} remediated, {st.fix_repos_skipped} skipped (no repo)")
+        db_total = st.default_branch_ok + st.default_branch_fixed + st.default_branch_failed
+        if db_total > 0:
+            print(f"Default Branch  : {st.default_branch_ok} already main, {st.default_branch_fixed} fixed, {st.default_branch_failed} failed (of {db_total})")
+    else:
+        repo_total = st.repo_success + st.repo_fail
+        if repo_total > 0:
+            repo_pct = (st.repo_success / repo_total) * 100
+            print(f"Veracode Repos  : {st.repo_success} success, {st.repo_fail} failed ({repo_pct:.1f}% success)")
 
     app_total = st.app_installed + st.app_missing
     if app_total > 0:
