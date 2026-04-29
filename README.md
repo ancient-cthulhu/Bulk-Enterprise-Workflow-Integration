@@ -16,6 +16,8 @@ For each organization, the script can:
 
 All operations are idempotent, safe to re-run. If a repo import completes after the script times out, the next run detects the incomplete state via the absence of `default-veracode.yml` and automatically applies the missing post-import steps.
 
+During import, the script verifies that `main` is set as the default branch immediately after the branch becomes visible. This prevents issues where GitHub sets a different default (e.g. `master`) when the source repo uses a different primary branch name.
+
 > **App installation is manual.** The script checks whether `veracode-workflow-app` is installed per org and generates `manual_install_links.csv` with a direct install URL for each org that needs it. Automated installation via the GitHub API is not supported for third-party apps.
 
 ---
@@ -61,6 +63,23 @@ python script.py --apply \
   --set-secrets
 ```
 
+### Phase 3 - Fix existing repos (compensatory pass)
+
+If repos were previously imported but may be missing post-import steps (wrong default branch, missing `veracode.yml`, teams not injected), run `--fix-repos` to audit and remediate across all orgs without re-importing:
+
+```bash
+# Audit only - no changes
+python script.py --dry-run --fix-repos --enterprise YOUR-ENTERPRISE
+
+# Fix default branch, veracode.yml, and teams injection
+python script.py --apply --fix-repos \
+  --enterprise YOUR-ENTERPRISE \
+  --set-teams-auto \
+  --update-veracode-yml /path/to/veracode.yml
+```
+
+See [Fix Existing Repos](#fix-existing-repos) for full details.
+
 ---
 
 ## Requirements
@@ -102,6 +121,7 @@ Admin credentials are never stored in any org. Service account credentials are w
 | `--import-repo` | No | No |
 | `--set-teams-*` | No | No |
 | `--update-veracode-yml` | No | No |
+| `--fix-repos` | No | No |
 
 ---
 
@@ -113,6 +133,7 @@ Admin credentials are never stored in any org. Service account credentials are w
 | `--enterprise` (org discovery) | + `read:enterprise` |
 | `--import-repo` / `--set-teams-*` | + `repo`, `workflow` |
 | `--update-veracode-yml` | + `repo`, `workflow` |
+| `--fix-repos` | + `repo`, `workflow` |
 | `--set-secrets` | `admin:org` *(already covered above)* |
 
 Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`, `workflow`
@@ -125,7 +146,7 @@ Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`,
 
 | Flag | Description |
 |------|-------------|
-| `--import-repo` | Create and populate the `veracode` repository |
+| `--import-repo` | Create and populate the `veracode` repository. Sets `main` as the default branch immediately after import. Cannot be combined with `--fix-repos` in the same run. |
 | `--set-teams-auto` | Inject `teams: "<org-name>"` for every org |
 | `--set-teams-file FILE` | Inject per-org team values from `teams_map.csv`. Blank rows are skipped. |
 | `--set-teams-hybrid FILE` | Same as `--set-teams-file` but blank rows fall back to the org name |
@@ -133,6 +154,7 @@ Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`,
 | `--create-teams` | Create teams on the Veracode platform via the Identity API if they do not already exist. Uses the resolved teams value from `--set-teams-auto/file/hybrid` (after prefix). Requires `VERACODE_API_ID` and `VERACODE_API_KEY`. Must be combined with one of the `--set-teams-*` flags. See [Platform Team Creation](#platform-team-creation). |
 | `--set-secrets` | Set `VERACODE_API_ID`, `VERACODE_API_KEY`, `VERACODE_AGENT_TOKEN` per org. Always overwrites all three - safe to re-run for annual credential rotation. The SCA agent token is regenerated via `token:regenerate` on each run, invalidating the previous one. |
 | `--update-veracode-yml [FILE]` | Push a `veracode.yml` to the `veracode` repo in every org. By default fetches `veracode.yml` directly from the upstream integration repo (`github.com/veracode/github-actions-integration`). Pass a local `FILE` path to use a custom file instead. The current file is backed up as `default-veracode.yml` first. Orgs with a missing or not-yet-imported repo are skipped with a warning. |
+| `--fix-repos` | Compensatory pass for already-imported repos. See [Fix Existing Repos](#fix-existing-repos). Cannot be combined with `--import-repo` in the same run. |
 
 ### Configuration
 
@@ -146,6 +168,85 @@ Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`,
 | `--skip-to ORG` | - | Skip all orgs before this one |
 | `--continue` | - | Resume from last checkpoint |
 | `--workers N` | `1` | Number of parallel worker threads. See [Parallel Execution](#parallel-execution). |
+
+---
+
+## Fix Existing Repos
+
+The `--fix-repos` flag is a compensatory pass designed for situations where repos were previously imported but post-import steps may be incomplete or were never applied. It does not re-import repos - it only operates on repos that already exist and are non-empty.
+
+For each org it checks and, in apply mode, remediates:
+
+1. **Default branch** - reads the current default branch and changes it to `main` via `PATCH /repos/{org}/{repo}` if it is not already `main`
+2. **`veracode.yml`** - checks for the file's presence and adds or updates it if missing (uses `--update-veracode-yml FILE` if provided, otherwise falls back to the local `veracode.yml` next to the script)
+3. **Teams injection** - injects or updates the `teams:` parameter in workflow files if a teams mode flag is active
+
+Orgs where the `veracode` repo does not exist or is empty are skipped and counted separately in the summary. Use `--import-repo` for those orgs in a separate run.
+
+`--fix-repos` is compatible with `--dry-run` to audit the fleet without making any changes.
+
+`--fix-repos` cannot be combined with `--import-repo` in the same run.
+
+### Default branch behavior
+
+`set_default_branch` handles three outcomes:
+
+| Outcome | Meaning |
+|---------|---------|
+| `already_main` | Default branch is already `main`, no change made |
+| `set_to_main` | Default branch was changed from another value to `main` |
+| `branch_not_found` | `main` branch does not exist in the repo yet - repo may still be processing |
+| `failed` | API call failed |
+
+### Usage examples
+
+```bash
+# Audit only - report issues without making changes
+python script.py --dry-run --fix-repos --enterprise YOUR-ENTERPRISE
+
+# Fix default branch and veracode.yml only
+python script.py --apply --fix-repos \
+  --enterprise YOUR-ENTERPRISE \
+  --update-veracode-yml /path/to/veracode.yml
+
+# Fix everything: default branch, veracode.yml, and teams injection
+python script.py --apply --fix-repos \
+  --enterprise YOUR-ENTERPRISE \
+  --set-teams-auto \
+  --update-veracode-yml /path/to/veracode.yml
+
+# Scoped to specific orgs
+python script.py --apply --fix-repos \
+  --orgs-file out/orgs.txt \
+  --set-teams-file out/teams_map.csv \
+  --update-veracode-yml /path/to/veracode.yml
+
+# Parallel fix across a large fleet
+python script.py --apply --fix-repos \
+  --enterprise YOUR-ENTERPRISE \
+  --set-teams-auto \
+  --update-veracode-yml /path/to/veracode.yml \
+  --workers 5
+```
+
+### fix_repos audit report entry
+
+```json
+{
+  "org": "acme-dev",
+  "fix_repos": {
+    "repo_exists": true,
+    "repo_empty": false,
+    "default_branch": "main",
+    "default_branch_ok": true,
+    "default_branch_action": "set_to_main",
+    "veracode_yml_present": false,
+    "veracode_yml_action": "created",
+    "teams_action": "teams_updated_2_files",
+    "needs_remediation": true
+  }
+}
+```
 
 ---
 
@@ -308,6 +409,7 @@ The script resolves orgs in this order:
     "present": true,
     "status": "repo_created_and_imported",
     "import_method": "git_cli_auto",
+    "default_branch_action": "set_to_main",
     "veracode_yml_injected": "created"
   },
   "veracode_team_platform": {
@@ -345,6 +447,8 @@ The script resolves orgs in this order:
 `veracode_yml_update.action` values: `updated_with_backup`, `created`, `repo_not_found`, `repo_empty`, `put_failed:<status_code>`.
 
 `veracode_repo.status` values: `repo_exists`, `repo_exists_post_import_incomplete` (imported but post-import steps never ran - self-healed on this run), `repo_created_and_imported`, `repo_created_import_incomplete` (push succeeded but main branch not found yet), `repo_created_manual_import_required`, `missing`.
+
+`veracode_repo.default_branch_action` values: `already_main`, `set_to_main`, `branch_not_found`, `failed`.
 
 `secrets.status` values in dry-run: `all_exist`, `all_missing`, `partial`, `no_permission` (token lacks `admin:org` scope).
 
