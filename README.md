@@ -65,20 +65,16 @@ python script.py --apply \
 
 ### Phase 3 - Fix existing repos (compensatory pass)
 
-If repos were previously imported but may be missing post-import steps (wrong default branch, missing `veracode.yml`, teams not injected), run `--fix-repos` to audit and remediate across all orgs without re-importing:
+For already-imported repos that may have landed with the wrong default branch, missing `veracode.yml`, or teams not injected, use `--fix-repos` to audit and remediate without re-importing. See [Fix Existing Repos](#fix-existing-repos).
 
 ```bash
-# Audit only - no changes
+# Audit only
 python script.py --dry-run --fix-repos --enterprise YOUR-ENTERPRISE
 
-# Fix default branch, veracode.yml, and teams injection
-python script.py --apply --fix-repos \
-  --enterprise YOUR-ENTERPRISE \
-  --set-teams-auto \
-  --update-veracode-yml /path/to/veracode.yml
+# Remediate
+python script.py --apply --fix-repos --enterprise YOUR-ENTERPRISE \
+  --set-teams-auto --update-veracode-yml /path/to/veracode.yml
 ```
-
-See [Fix Existing Repos](#fix-existing-repos) for full details.
 
 ---
 
@@ -173,80 +169,15 @@ Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`,
 
 ## Fix Existing Repos
 
-The `--fix-repos` flag is a compensatory pass designed for situations where repos were previously imported but post-import steps may be incomplete or were never applied. It does not re-import repos - it only operates on repos that already exist and are non-empty.
+`--fix-repos` operates on already-imported repos only (skips orgs where the `veracode` repo is missing or empty - use `--import-repo` for those). For each qualifying org it checks and remediates:
 
-For each org it checks and, in apply mode, remediates:
+1. **Default branch** - sets `main` as default if it is not already
+2. **`veracode.yml`** - adds or updates the file if missing (uses `--update-veracode-yml FILE` if provided, otherwise falls back to the local `veracode.yml` next to the script)
+3. **Teams injection** - injects or updates `teams:` in workflow files if a `--set-teams-*` flag is active
 
-1. **Default branch** - reads the current default branch and changes it to `main` via `PATCH /repos/{org}/{repo}` if it is not already `main`
-2. **`veracode.yml`** - checks for the file's presence and adds or updates it if missing (uses `--update-veracode-yml FILE` if provided, otherwise falls back to the local `veracode.yml` next to the script)
-3. **Teams injection** - injects or updates the `teams:` parameter in workflow files if a teams mode flag is active
+Compatible with `--dry-run` to audit without making changes. Cannot be combined with `--import-repo` in the same run.
 
-Orgs where the `veracode` repo does not exist or is empty are skipped and counted separately in the summary. Use `--import-repo` for those orgs in a separate run.
-
-`--fix-repos` is compatible with `--dry-run` to audit the fleet without making any changes.
-
-`--fix-repos` cannot be combined with `--import-repo` in the same run.
-
-### Default branch behavior
-
-`set_default_branch` handles three outcomes:
-
-| Outcome | Meaning |
-|---------|---------|
-| `already_main` | Default branch is already `main`, no change made |
-| `set_to_main` | Default branch was changed from another value to `main` |
-| `branch_not_found` | `main` branch does not exist in the repo yet - repo may still be processing |
-| `failed` | API call failed |
-
-### Usage examples
-
-```bash
-# Audit only - report issues without making changes
-python script.py --dry-run --fix-repos --enterprise YOUR-ENTERPRISE
-
-# Fix default branch and veracode.yml only
-python script.py --apply --fix-repos \
-  --enterprise YOUR-ENTERPRISE \
-  --update-veracode-yml /path/to/veracode.yml
-
-# Fix everything: default branch, veracode.yml, and teams injection
-python script.py --apply --fix-repos \
-  --enterprise YOUR-ENTERPRISE \
-  --set-teams-auto \
-  --update-veracode-yml /path/to/veracode.yml
-
-# Scoped to specific orgs
-python script.py --apply --fix-repos \
-  --orgs-file out/orgs.txt \
-  --set-teams-file out/teams_map.csv \
-  --update-veracode-yml /path/to/veracode.yml
-
-# Parallel fix across a large fleet
-python script.py --apply --fix-repos \
-  --enterprise YOUR-ENTERPRISE \
-  --set-teams-auto \
-  --update-veracode-yml /path/to/veracode.yml \
-  --workers 5
-```
-
-### fix_repos audit report entry
-
-```json
-{
-  "org": "acme-dev",
-  "fix_repos": {
-    "repo_exists": true,
-    "repo_empty": false,
-    "default_branch": "main",
-    "default_branch_ok": true,
-    "default_branch_action": "set_to_main",
-    "veracode_yml_present": false,
-    "veracode_yml_action": "created",
-    "teams_action": "teams_updated_2_files",
-    "needs_remediation": true
-  }
-}
-```
+`default_branch_action` values in the audit report: `already_main`, `set_to_main`, `branch_not_found` (main branch not visible yet - repo may still be processing), `failed`.
 
 ---
 
