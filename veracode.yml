@@ -36,7 +36,7 @@ veracode_static_scan:
   issues:
     trigger: true
     commands:
-      - "Veracode SAST Scan"
+      - "Veracode Static Scan"
       - "Veracode All Scans"
 
 veracode_sca_scan:
