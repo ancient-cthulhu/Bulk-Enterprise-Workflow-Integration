@@ -156,6 +156,8 @@ class RunStats:
     fix_repos_checked: int = 0
     fix_repos_remediated: int = 0
     fix_repos_skipped: int = 0
+    reimports_done: int = 0
+    reimports_failed: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -876,7 +878,8 @@ def set_default_branch(
     """
     Set the default branch for a repo.
     Returns (success, action) where action is one of:
-    'already_main', 'set_to_main', 'branch_not_found', 'failed'.
+    'already_main', 'set_to_main', 'branch_not_found' (caller should re-import),
+    'failed'.
     """
     current = get_repo_default_branch(api_base, org, repo, token)
     if current is None:
@@ -885,6 +888,11 @@ def set_default_branch(
 
     if current == branch:
         return True, "already_main"
+
+    target_exists_r = request("GET", f"{api_base}/repos/{org}/{repo}/branches/{branch}", token)
+    if target_exists_r.status_code != 200:
+        log(f"  [{org}] Branch '{branch}' does not exist in {repo} - repo needs re-import from upstream")
+        return False, "branch_not_found"
 
     r = request("PATCH", f"{api_base}/repos/{org}/{repo}", token, json={"default_branch": branch})
     if r.status_code == 200:
@@ -895,7 +903,7 @@ def set_default_branch(
         body = r.json()
         msg = str(body).lower()
         if "does not exist" in msg or "not found" in msg or "invalid" in msg:
-            log(f"  [{org}] Branch '{branch}' does not exist in {repo} - cannot set as default")
+            log(f"  [{org}] Branch '{branch}' does not exist in {repo} - repo needs re-import from upstream")
             return False, "branch_not_found"
 
     log(f"  [{org}] PATCH default_branch failed: {r.status_code} - {r.text[:200]}")
@@ -920,6 +928,10 @@ def check_and_fix_default_branch(
     if current == "main":
         return True, "already_main"
     if dry_run:
+        main_r = request("GET", f"{api_base}/repos/{org}/{repo}/branches/main", token)
+        if main_r.status_code != 200:
+            log(f"  [{org}] Default branch is '{current}' and 'main' does not exist - would re-import in apply mode")
+            return False, "branch_not_found"
         log(f"  [{org}] Default branch is '{current}' (not 'main') - would fix in apply mode")
         return False, f"needs_fix:{current}"
     return set_default_branch(api_base, org, repo, token, "main", log)
@@ -940,6 +952,7 @@ class RepoHealthResult:
     veracode_yml_present: bool = False
     veracode_yml_action: str = "not_checked"
     teams_action: str = "not_checked"
+    reimport_action: str = "not_needed"
     needs_remediation: bool = False
 
 
@@ -952,6 +965,8 @@ def check_repo_health(
     teams_value: str | None,
     onboarding_yml_content: str | None,
     dry_run: bool,
+    web_base: str = "https://github.com",
+    cached_clone_dir: str | None = None,
     log: Callable[[str], None] = tprint,
 ) -> RepoHealthResult:
     result = RepoHealthResult(org=org)
@@ -975,9 +990,51 @@ def check_repo_health(
     if not db_ok:
         result.needs_remediation = True
 
+    # --- Re-import trigger: main missing OR workflow files missing -----------
+    needs_reimport = db_action == "branch_not_found"
+
+    if not needs_reimport:
+        sandbox_url = f"{api_base}/repos/{org}/{repo}/contents/.github/workflows/veracode-sandbox-scan.yml"
+        policy_url = f"{api_base}/repos/{org}/{repo}/contents/.github/workflows/veracode-policy-scan.yml"
+        sandbox_r = request("GET", sandbox_url, token, params={"ref": "main"})
+        policy_r = request("GET", policy_url, token, params={"ref": "main"})
+        if sandbox_r.status_code != 200 and policy_r.status_code != 200:
+            log(f"  [{org}] Workflow files missing on 'main' - triggering re-import from upstream")
+            needs_reimport = True
+
+    if needs_reimport:
+        result.needs_remediation = True
+        if dry_run:
+            result.reimport_action = "would_reimport"
+            log(f"  [{org}] Would re-import {repo} from upstream in apply mode")
+        elif not check_git_available():
+            result.reimport_action = "git_not_available"
+            log(f"  [{org}] Git CLI not available - cannot re-import")
+        else:
+            ok, msg = git_mirror_import(
+                INTEGRATION_SOURCE_URL, org, repo, token, web_base, cached_clone_dir,
+            )
+            if not ok:
+                result.reimport_action = f"failed:{msg[:120]}"
+                log(f"  [{org}] Re-import failed: {msg[:200]}")
+                return result
+
+            log(f"  [{org}] Re-import push succeeded - waiting for GitHub to publish 'main'...")
+            if not wait_for_main_branch(api_base, org, repo, token, log=log):
+                result.reimport_action = "reimport_main_not_visible"
+                log(f"  [{org}] 'main' branch not visible after re-import - re-run later")
+                return result
+
+            db_ok, db_action = set_default_branch(api_base, org, repo, token, "main", log)
+            result.default_branch = get_repo_default_branch(api_base, org, repo, token)
+            result.default_branch_ok = db_ok
+            result.default_branch_action = db_action
+            result.reimport_action = "reimported"
+            log(f"  [{org}] Re-import complete; default branch action: {db_action}")
+
     # --- veracode.yml presence ------------------------------------------------
     yml_url = f"{api_base}/repos/{org}/{repo}/contents/veracode.yml"
-    r = request("GET", yml_url, token)
+    r = request("GET", yml_url, token, params={"ref": "main"})
     result.veracode_yml_present = r.status_code == 200
 
     effective_yml = yml_content or onboarding_yml_content
@@ -1073,7 +1130,7 @@ def inject_teams_into_workflows(
 
     for workflow_path in workflow_files:
         url = f"{api_base}/repos/{org}/{repo}/contents/{workflow_path}"
-        r = request("GET", url, token)
+        r = request("GET", url, token, params={"ref": "main"})
         if r.status_code != 200:
             continue
 
@@ -1103,10 +1160,31 @@ def inject_teams_into_workflows(
             "branch": "main",
         }
         r = request("PUT", url, token, json=payload)
+
+        if r.status_code == 409:
+            # Stale sha race: re-fetch and retry once with fresh sha.
+            log(f"  [{org}] PUT {workflow_path} returned 409 (stale sha) - refetching and retrying")
+            r_refetch = request("GET", url, token, params={"ref": "main"})
+            if r_refetch.status_code == 200:
+                fresh_sha = r_refetch.json().get("sha")
+                fresh_content = b64decode(r_refetch.json().get("content", "")).decode("utf-8")
+                fresh_new, _ = _inject_teams_regex(fresh_content, teams_value)
+                if update_existing:
+                    fresh_new, _ = _update_teams_value(fresh_new, teams_value)
+                payload["sha"] = fresh_sha
+                payload["content"] = b64encode(fresh_new.encode("utf-8")).decode("utf-8")
+                r = request("PUT", url, token, json=payload)
+
         if r.status_code in (200, 201):
             modified_count += 1
+        elif r.status_code == 409:
+            log(f"  [{org}] {workflow_path} on main: 409 conflict after retry. "
+                f"Likely a branch protection rule requires PRs - manual fix needed.")
+        elif r.status_code == 422 and "protected branch" in r.text.lower():
+            log(f"  [{org}] {workflow_path} on main: protected branch - direct push rejected. "
+                f"Manual fix or PR required.")
         else:
-            log(f"  [{org}] Failed to update {workflow_path}: {r.status_code}")
+            log(f"  [{org}] Failed to update {workflow_path} on main: {r.status_code} {r.text[:200]}")
 
     if modified_count > 0:
         return True, f"teams_updated_{modified_count}_files"
@@ -1130,13 +1208,13 @@ def _put_veracode_yml_with_backup(
     veracode_url = f"{api_base}/repos/{org}/{repo}/contents/veracode.yml"
     default_veracode_url = f"{api_base}/repos/{org}/{repo}/contents/default-veracode.yml"
 
-    r = request("GET", veracode_url, token)
+    r = request("GET", veracode_url, token, params={"ref": "main"})
     if r.status_code == 200:
         original_data = r.json()
         original_sha = original_data.get("sha")
         original_content_b64 = original_data.get("content", "")
 
-        r_default = request("GET", default_veracode_url, token)
+        r_default = request("GET", default_veracode_url, token, params={"ref": "main"})
         backup_payload: dict[str, Any] = {
             "message": "Preserve current veracode.yml as default-veracode.yml before update",
             "content": original_content_b64,
@@ -1665,6 +1743,8 @@ def process_org(
                 teams_value=fix_teams_value,
                 onboarding_yml_content=ctx.onboarding_yml_content,
                 dry_run=ctx.dry_run,
+                web_base=ctx.web_base,
+                cached_clone_dir=cached_clone_dir,
                 log=buf.add,
             )
             entry["fix_repos"] = {
@@ -1676,6 +1756,7 @@ def process_org(
                 "veracode_yml_present": health.veracode_yml_present,
                 "veracode_yml_action": health.veracode_yml_action,
                 "teams_action": health.teams_action,
+                "reimport_action": health.reimport_action,
                 "needs_remediation": health.needs_remediation,
             }
             with ctx.stats_lock:
@@ -1690,6 +1771,30 @@ def process_org(
                     ctx.stats.default_branch_fixed += 1
                 elif health.default_branch_action not in ("not_checked", "read_failed"):
                     ctx.stats.default_branch_failed += 1
+
+                ta = health.teams_action
+                if ta.startswith("teams_updated"):
+                    ctx.stats.teams_updated += 1
+                elif ta == "teams_already_current":
+                    ctx.stats.teams_skipped += 1
+                elif ta in ("no_workflow_files_found",):
+                    ctx.stats.teams_failed += 1
+                elif ta.startswith("error") or ta.startswith("failed"):
+                    ctx.stats.teams_failed += 1
+
+                ya = health.veracode_yml_action
+                if ya in ("created", "updated_with_backup"):
+                    ctx.stats.yml_updated += 1
+                elif ya == "present_no_update":
+                    ctx.stats.yml_skipped += 1
+                elif ya.startswith("failed") or ya.startswith("put_failed") or ya.startswith("get_failed"):
+                    ctx.stats.yml_failed += 1
+
+                ra = health.reimport_action
+                if ra == "reimported":
+                    ctx.stats.reimports_done += 1
+                elif ra.startswith("failed") or ra in ("git_not_available", "reimport_main_not_visible"):
+                    ctx.stats.reimports_failed += 1
         except Exception as exc:
             entry["fix_repos"] = {"error": str(exc)}
             with ctx.stats_lock:
@@ -1924,9 +2029,11 @@ def process_org(
         db_action = fix_info.get("default_branch_action", "?")
         yml_action = fix_info.get("veracode_yml_action", "?")
         teams_action = fix_info.get("teams_action", "?")
+        reimport_action = fix_info.get("reimport_action", "not_needed")
         app_status = "[OK]" if entry.get("workflow_app", {}).get("installed") else "[FAIL]"
+        reimport_detail = f"  Reimport: [{reimport_action}]" if reimport_action != "not_needed" else ""
         buf.add(
-            f"  DefaultBranch: [{db_action}]  YML: [{yml_action}]  "
+            f"  DefaultBranch: [{db_action}]{reimport_detail}  YML: [{yml_action}]  "
             f"Teams: [{teams_action}]  App: {app_status}"
         )
         return
@@ -2333,8 +2440,8 @@ def main() -> None:
     workers = args.workers
 
     _cached_clone_dir: str | None = None
-    if do_apply_repo and check_git_available():
-        label = "[PARALLEL]" if workers > 1 else "[import-repo]"
+    if (do_apply_repo or (do_fix_repos and args.apply)) and check_git_available():
+        label = "[PARALLEL]" if workers > 1 else ("[fix-repos]" if do_fix_repos else "[import-repo]")
         print(f"{label} Pre-cloning integration repo...")
         clone_ok, clone_msg, _cached_clone_dir = git_clone_bare(INTEGRATION_SOURCE_URL)
         if clone_ok:
@@ -2431,6 +2538,8 @@ def main() -> None:
         db_total = st.default_branch_ok + st.default_branch_fixed + st.default_branch_failed
         if db_total > 0:
             print(f"Default Branch  : {st.default_branch_ok} already main, {st.default_branch_fixed} fixed, {st.default_branch_failed} failed (of {db_total})")
+        if st.reimports_done > 0 or st.reimports_failed > 0:
+            print(f"Re-imports      : {st.reimports_done} done, {st.reimports_failed} failed")
     else:
         repo_total = st.repo_success + st.repo_fail
         if repo_total > 0:
