@@ -43,6 +43,30 @@ _VERACODE_SECRET_NAMES: tuple[str, ...] = (
     "VERACODE_AGENT_TOKEN",
 )
 
+# GitHub Actions the integration requires to be allowlisted when an org uses
+# the "selected" actions policy. github.com-owned actions (actions/*) are
+# covered by the github_owned_allowed flag and are not listed here.
+_REQUIRED_ACTION_PATTERNS: tuple[str, ...] = (
+    "actions/checkout@*",
+    "actions/download-artifact@*",
+    "actions/setup-java@*",
+    "actions/upload-artifact@*",
+    "android-actions/setup-android@*",
+    "flutter-actions/setup-flutter@*",
+    "octokit/request-action@*",
+    "veracode/container_iac_secrets_scanning@*",
+    "veracode/github-actions-integration-helper@*",
+    "veracode/uploadandscan-action@*",
+    "veracode/veracode-flaws-to-issues@*",
+    "veracode/Veracode-pipeline-scan-action@*",
+    "veracode/veracode-pipeline-scan-results-to-sarif@*",
+    "veracode/veracode-sca@*",
+)
+
+# actions/* patterns are satisfied by github_owned_allowed=true, so they do not
+# need to appear in patterns_allowed.
+_GITHUB_OWNED_PREFIX = "actions/"
+
 _print_lock = threading.Lock()
 _rate_limit_lock = threading.Lock()
 _rate_limit_pause_until: float = 0.0
@@ -158,6 +182,9 @@ class RunStats:
     fix_repos_skipped: int = 0
     reimports_done: int = 0
     reimports_failed: int = 0
+    actions_allowed: int = 0
+    actions_missing: int = 0
+    actions_no_permission: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +223,7 @@ class RunContext:
     missing_repo_rows: list[list[str]] = field(default_factory=list)
     missing_app_rows: list[list[str]] = field(default_factory=list)
     manual_links_rows: list[list[str]] = field(default_factory=list)
+    actions_allowlist_rows: list[list[str]] = field(default_factory=list)
     completed_orgs: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -473,7 +501,13 @@ def git_mirror_import(
 
         push_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
         push_result = subprocess.run(
-            ["git", "-C", bare_repo, "push", "--mirror", target_url],
+            [
+                "git", "-C", bare_repo,
+                "-c", "credential.helper=",
+                "-c", "credential.helper=cache",
+                "-c", "http.https://github.com/.extraheader=",
+                "push", "--mirror", target_url,
+            ],
             capture_output=True, text=True, env=push_env,
         )
         if push_result.returncode != 0:
@@ -1608,6 +1642,73 @@ def check_app_installed(api_base: str, web_base: str, org: str, token: str) -> t
 
 
 # ---------------------------------------------------------------------------
+# Actions allowlist prerequisite check
+# ---------------------------------------------------------------------------
+
+def check_actions_allowlist(api_base: str, org: str, token: str) -> dict[str, Any]:
+    """
+    Verify the org's GitHub Actions policy permits the actions the integration needs.
+
+    Returns a dict with:
+      status: 'all_allowed' | 'local_only' | 'selected_ok' | 'selected_missing'
+              | 'no_permission' | 'error'
+      missing: list of required patterns not allowlisted (only for selected_missing)
+      detail: short human-readable note
+    """
+    try:
+        r = request("GET", f"{api_base}/orgs/{org}/actions/permissions", token)
+        if r.status_code == 403:
+            return {"status": "no_permission", "missing": [], "detail": "token lacks admin:org to read Actions policy"}
+        if r.status_code != 200:
+            return {"status": "error", "missing": [], "detail": f"permissions GET {r.status_code}"}
+
+        allowed = r.json().get("allowed_actions")
+
+        if allowed == "all":
+            return {"status": "all_allowed", "missing": [], "detail": "all actions permitted"}
+
+        if allowed == "local_only":
+            return {
+                "status": "local_only",
+                "missing": list(_REQUIRED_ACTION_PATTERNS),
+                "detail": "policy is local_only - third-party Veracode actions are blocked",
+            }
+
+        if allowed == "selected":
+            sr = request("GET", f"{api_base}/orgs/{org}/actions/permissions/selected-actions", token)
+            if sr.status_code == 403:
+                return {"status": "no_permission", "missing": [], "detail": "token lacks admin:org to read selected-actions"}
+            if sr.status_code != 200:
+                return {"status": "error", "missing": [], "detail": f"selected-actions GET {sr.status_code}"}
+
+            body = sr.json()
+            github_owned_allowed = bool(body.get("github_owned_allowed"))
+            patterns = set(body.get("patterns_allowed") or [])
+
+            missing: list[str] = []
+            for pat in _REQUIRED_ACTION_PATTERNS:
+                if pat.startswith(_GITHUB_OWNED_PREFIX):
+                    if not github_owned_allowed and pat not in patterns:
+                        missing.append(pat)
+                else:
+                    if pat not in patterns:
+                        missing.append(pat)
+
+            if missing:
+                return {
+                    "status": "selected_missing",
+                    "missing": missing,
+                    "detail": f"{len(missing)} required action(s) not allowlisted",
+                }
+            return {"status": "selected_ok", "missing": [], "detail": "all required actions allowlisted"}
+
+        return {"status": "error", "missing": [], "detail": f"unknown allowed_actions value: {allowed}"}
+
+    except Exception as exc:
+        return {"status": "error", "missing": [], "detail": str(exc)[:120]}
+
+
+# ---------------------------------------------------------------------------
 # Credential validation
 # ---------------------------------------------------------------------------
 
@@ -1911,6 +2012,32 @@ def process_org(
         with ctx.stats_lock:
             ctx.stats.app_missing += 1
         buf.add(f"  App check error: {str(exc)[:80]}")
+
+    # --- Actions allowlist prerequisite check (warn-only) ---------------------
+    try:
+        allow = check_actions_allowlist(ctx.api_base, org, ctx.token)
+        entry["actions_allowlist"] = allow
+        status = allow["status"]
+        with ctx.stats_lock:
+            if status in ("all_allowed", "selected_ok"):
+                ctx.stats.actions_allowed += 1
+            elif status == "no_permission":
+                ctx.stats.actions_no_permission += 1
+            elif status in ("local_only", "selected_missing"):
+                ctx.stats.actions_missing += 1
+        if status in ("local_only", "selected_missing"):
+            missing = allow.get("missing", [])
+            preview = ", ".join(missing[:4]) + (f" (+{len(missing) - 4} more)" if len(missing) > 4 else "")
+            buf.add(f"  [WARNING] Actions allowlist incomplete - integration will break: {allow['detail']}")
+            if preview:
+                buf.add(f"            Missing: {preview}")
+            with ctx.rows_lock:
+                ctx.actions_allowlist_rows.append(
+                    [org, status, "; ".join(missing) if missing else allow.get("detail", "")]
+                )
+    except Exception as exc:
+        entry["actions_allowlist"] = {"status": "error", "missing": [], "detail": str(exc)[:120]}
+        buf.add(f"  Actions allowlist check error: {str(exc)[:80]}")
 
     # --- veracode.yml update --------------------------------------------------
     if ctx.do_update_yml and ctx.yml_content and not ctx.do_fix_repos:
@@ -2306,6 +2433,22 @@ def main() -> None:
     else:
         print("  No changes will be made (use --apply to enable changes)")
     print(f"  Workers               : {args.workers}{' (parallel)' if args.workers > 1 else ' (sequential)'}")
+    print(f"{'=' * 60}")
+
+    print("\nPREREQUISITES (verify before relying on scan results):")
+    print("  Auto-checked per org (warn-only): GitHub Actions allowlist permits the")
+    print("    required Veracode actions. See actions_allowlist_issues.csv after the run.")
+    print("  Manual - confirm yourself:")
+    print("    - GitHub: you have organization owner or admin permissions to install")
+    print("      third-party apps.")
+    print("    - Veracode Platform: you have the Administrator or Security Lead role.")
+    print("    - Veracode Platform: valid API credentials (static scans) and/or a valid")
+    print("      SCA agent token (agent-based SCA scans).")
+    print("    - The Veracode GitHub Workflow Integration is NOT supported in the United")
+    print("      States Federal Region.")
+    if "fed" in api_base.lower() or "fedramp" in web_base.lower():
+        print("    [WARNING] api-base/web-base looks like a US Federal endpoint - this")
+        print("              integration is not supported there.")
     print(f"{'=' * 60}\n")
 
     outdir = Path(args.out)
@@ -2514,6 +2657,7 @@ def main() -> None:
     write_csv(outdir / "missing_veracode_repo.csv", ["organization", "repo_name", "note"], ctx.missing_repo_rows)
     write_csv(outdir / "missing_workflow_app.csv", ["organization", "app_slug", "note"], ctx.missing_app_rows)
     write_csv(outdir / "manual_install_links.csv", ["organization", "install_link", "reason"], ctx.manual_links_rows)
+    write_csv(outdir / "actions_allowlist_issues.csv", ["organization", "status", "missing_or_detail"], ctx.actions_allowlist_rows)
 
     st = ctx.stats
     st.end_time = datetime.now()
@@ -2550,6 +2694,12 @@ def main() -> None:
     if app_total > 0:
         print(f"Workflow App    : {st.app_installed} installed, {st.app_missing} missing (see manual_install_links.csv)")
 
+    actions_total = st.actions_allowed + st.actions_missing + st.actions_no_permission
+    if actions_total > 0:
+        np_suffix = "" if st.actions_no_permission == 0 else f", {st.actions_no_permission} unverifiable (no admin:org)"
+        print(f"Actions Allowlist: {st.actions_allowed} ok, {st.actions_missing} incomplete{np_suffix} "
+              f"(see actions_allowlist_issues.csv)")
+
     if do_create_teams:
         pt_total = st.teams_created_on_platform + st.teams_already_exist_on_platform + st.teams_create_failed_on_platform
         print(f"Platform Teams  : {st.teams_created_on_platform} created, "
@@ -2584,6 +2734,7 @@ def main() -> None:
     print(" - missing_veracode_repo.csv")
     print(" - missing_workflow_app.csv")
     print(" - manual_install_links.csv")
+    print(" - actions_allowlist_issues.csv")
 
     if ctx.missing_repo_rows or ctx.missing_app_rows:
         print(f"\n  Note: {len(ctx.missing_repo_rows)} org(s) have missing repos, "
