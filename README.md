@@ -2,17 +2,17 @@
 
 Deploys Veracode security scanning across GitHub Enterprise organizations at scale. Handles repository creation, workflow configuration, team assignments, Veracode platform team provisioning, app installation, and secrets management with audit trails, checkpoint/resume support, and parallel execution.
 
----
+-----
 
 ## How It Works
 
 For each organization, the script can:
 
 1. Create the `veracode` integration repository and mirror-import the Veracode workflow template
-2. Inject a customized `veracode.yml` onboarding configuration
-3. Create teams on the Veracode platform via the Identity API (if they do not already exist)
-4. Inject `teams:` parameter into workflow files
-5. Create a Veracode SCA workspace, generate a unique agent token, and set GitHub Actions secrets
+1. Inject a customized `veracode.yml` onboarding configuration
+1. Create teams on the Veracode platform via the Identity API (if they do not already exist)
+1. Inject `teams:` parameter into workflow files
+1. Create a Veracode SCA workspace, generate a unique agent token, and set GitHub Actions secrets
 
 All operations are idempotent, safe to re-run. If a repo import completes after the script times out, the next run detects the incomplete state via the absence of `default-veracode.yml` and automatically applies the missing post-import steps.
 
@@ -20,16 +20,31 @@ During import, the script verifies that `main` is set as the default branch imme
 
 > **App installation is manual.** The script checks whether `veracode-workflow-app` is installed per org and generates `manual_install_links.csv` with a direct install URL for each org that needs it. Automated installation via the GitHub API is not supported for third-party apps.
 
----
+-----
+
+## Prerequisites
+
+Before relying on scan results, confirm the following. The script prints these as a reminder on every run and auto-checks the items marked below.
+
+**Auto-checked per org (warn-only):** the GitHub Actions allowlist permits the Veracode actions the integration needs. Problem orgs are written to `actions_allowlist_issues.csv`. See [Actions Allowlist Check](#actions-allowlist-check).
+
+**Confirm manually:**
+
+- GitHub: organization owner or admin permissions to install third-party apps.
+- Veracode Platform: the Administrator or Security Lead role.
+- Veracode Platform: valid API credentials (static scans) and/or a valid SCA agent token (agent-based SCA scans).
+- The Veracode GitHub Workflow Integration is **not supported** in the United States Federal Region.
+
+-----
 
 ## Modes
 
-| Mode | Flag | Behavior |
-|------|------|----------|
-| Dry-run | *(default)* | Read-only. Reports current state and generates helper output files. |
-| Apply | `--apply` | Makes changes. Requires one or more action flags. |
+|Mode   |Flag       |Behavior                                                           |
+|-------|-----------|-------------------------------------------------------------------|
+|Dry-run|*(default)*|Read-only. Reports current state and generates helper output files.|
+|Apply  |`--apply`  |Makes changes. Requires one or more action flags.                  |
 
----
+-----
 
 ## Quickstart
 
@@ -42,9 +57,10 @@ python script.py --enterprise YOUR-ENTERPRISE
 ```
 
 Discovers all orgs, checks current state, and writes output files to `./out/`:
+
 - `orgs.txt` - one org per line
 - `teams_map.csv` - fill in the `teams` column before apply
-- `missing_veracode_repo.csv`, `missing_workflow_app.csv`, `manual_install_links.csv`
+- `missing_veracode_repo.csv`, `missing_workflow_app.csv`, `manual_install_links.csv`, `actions_allowlist_issues.csv`
 
 ### Phase 2 - Apply
 
@@ -76,7 +92,7 @@ python script.py --apply --fix-repos --enterprise YOUR-ENTERPRISE \
   --set-teams-auto --update-veracode-yml /path/to/veracode.yml
 ```
 
----
+-----
 
 ## Requirements
 
@@ -89,7 +105,7 @@ git --version         # required for --import-repo
 
 Python 3.8+
 
----
+-----
 
 ## Credentials
 
@@ -97,12 +113,12 @@ Python 3.8+
 
 Two credential pairs serve different purposes:
 
-| Variable | Purpose | Account Type |
-|----------|---------|--------------|
-| `VERACODE_API_ID` | Admin - used by the script to call Veracode APIs (create workspaces, generate tokens, create teams) | **Human user account** with the **Administrator** role |
-| `VERACODE_API_KEY` | Admin | Same as above |
-| `VERACODE_SA_API_ID` | Service account - stored as `VERACODE_API_ID` in each org's Actions secrets | API service account |
-| `VERACODE_SA_API_KEY` | Service account - stored as `VERACODE_API_KEY` in each org's Actions secrets | API service account |
+|Variable             |Purpose                                                                                            |Account Type                                          |
+|---------------------|---------------------------------------------------------------------------------------------------|------------------------------------------------------|
+|`VERACODE_API_ID`    |Admin - used by the script to call Veracode APIs (create workspaces, generate tokens, create teams)|**Human user account** with the **Administrator** role|
+|`VERACODE_API_KEY`   |Admin                                                                                              |Same as above                                         |
+|`VERACODE_SA_API_ID` |Service account - stored as `VERACODE_API_ID` in each org’s Actions secrets                        |API service account                                   |
+|`VERACODE_SA_API_KEY`|Service account - stored as `VERACODE_API_KEY` in each org’s Actions secrets                       |API service account                                   |
 
 **Important:** The admin credentials (`VERACODE_API_ID` / `VERACODE_API_KEY`) must belong to a **human user account** with the **Administrator** role on the Veracode platform. API service accounts do not have sufficient permissions for the Identity API operations used by `--create-teams` and `--set-secrets`. The Identity API requires either a human user with the Administrator role or an API service account with the Admin API role, but workspace and agent token operations require a human administrator.
 
@@ -110,76 +126,88 @@ Admin credentials are never stored in any org. Service account credentials are w
 
 ### Which flags need which credentials
 
-| Flag | Requires `VERACODE_API_ID/KEY` | Requires `VERACODE_SA_API_ID/KEY` |
-|------|-------------------------------|-----------------------------------|
-| `--create-teams` | Yes | No |
-| `--set-secrets` | Yes | Yes |
-| `--import-repo` | No | No |
-| `--set-teams-*` | No | No |
-| `--update-veracode-yml` | No | No |
-| `--fix-repos` | No | No |
+|Flag                   |Requires `VERACODE_API_ID/KEY`|Requires `VERACODE_SA_API_ID/KEY`|
+|-----------------------|------------------------------|---------------------------------|
+|`--create-teams`       |Yes                           |No                               |
+|`--set-secrets`        |Yes                           |Yes                              |
+|`--import-repo`        |No                            |No                               |
+|`--set-teams-*`        |No                            |No                               |
+|`--update-veracode-yml`|No                            |No                               |
+|`--fix-repos`          |No                            |No                               |
 
----
+-----
 
 ## GitHub Token Permissions
 
-| Operation | Required Scopes |
-|-----------|----------------|
-| Dry-run | `read:org`, `admin:org` (`admin:org` required to check secret status - without it secrets show as `no_permission` in the report) |
-| `--enterprise` (org discovery) | + `read:enterprise` |
-| `--import-repo` / `--set-teams-*` | + `repo`, `workflow` |
-| `--update-veracode-yml` | + `repo`, `workflow` |
-| `--fix-repos` | + `repo`, `workflow` |
-| `--set-secrets` | `admin:org` *(already covered above)* |
+|Operation                        |Required Scopes                                                                                                                                        |
+|---------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
+|Dry-run                          |`read:org`, `admin:org` (`admin:org` required to check secret status and the Actions allowlist - without it both show as `no_permission` in the report)|
+|`--enterprise` (org discovery)   |+ `read:enterprise`                                                                                                                                    |
+|`--import-repo` / `--set-teams-*`|+ `repo`, `workflow`                                                                                                                                   |
+|`--update-veracode-yml`          |+ `repo`, `workflow`                                                                                                                                   |
+|`--fix-repos`                    |+ `repo`, `workflow`                                                                                                                                   |
+|`--set-secrets`                  |`admin:org` *(already covered above)*                                                                                                                  |
 
 Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`, `workflow`
 
----
+-----
 
 ## Command-Line Reference
 
 ### Action Flags *(require `--apply`)*
 
-| Flag | Description |
-|------|-------------|
-| `--import-repo` | Create and populate the `veracode` repository. Sets `main` as the default branch immediately after import. Cannot be combined with `--fix-repos` in the same run. |
-| `--set-teams-auto` | Inject `teams: "<org-name>"` for every org |
-| `--set-teams-file FILE` | Inject per-org team values from `teams_map.csv`. Blank rows are skipped. |
-| `--set-teams-hybrid FILE` | Same as `--set-teams-file` but blank rows fall back to the org name |
-| `--team-prefix PREFIX` | Prepend `PREFIX` to every resolved teams value. Applied after `--set-teams-auto/file/hybrid`. Example: `--team-prefix "gh-"` turns `acme-dev` into `gh-acme-dev`. Orgs with no resolved teams value (blank file row on the `--set-teams-file FILE` option) are not affected. |
-| `--create-teams` | Create teams on the Veracode platform via the Identity API if they do not already exist. Uses the resolved teams value from `--set-teams-auto/file/hybrid` (after prefix). Requires `VERACODE_API_ID` and `VERACODE_API_KEY`. Must be combined with one of the `--set-teams-*` flags. See [Platform Team Creation](#platform-team-creation). |
-| `--set-secrets` | Set `VERACODE_API_ID`, `VERACODE_API_KEY`, `VERACODE_AGENT_TOKEN` per org. Always overwrites all three - safe to re-run for annual credential rotation. The SCA agent token is regenerated via `token:regenerate` on each run, invalidating the previous one. |
-| `--update-veracode-yml [FILE]` | Push a `veracode.yml` to the `veracode` repo in every org. By default fetches `veracode.yml` directly from the upstream integration repo (`github.com/veracode/github-actions-integration`). Pass a local `FILE` path to use a custom file instead. The current file is backed up as `default-veracode.yml` first. Orgs with a missing or not-yet-imported repo are skipped with a warning. |
-| `--fix-repos` | Compensatory pass for already-imported repos. See [Fix Existing Repos](#fix-existing-repos). Cannot be combined with `--import-repo` in the same run. |
+|Flag                          |Description                                                                                                                                                                                                                                                                                                                                                                                |
+|------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|`--import-repo`               |Create and populate the `veracode` repository. Sets `main` as the default branch immediately after import. Cannot be combined with `--fix-repos` in the same run.                                                                                                                                                                                                                          |
+|`--set-teams-auto`            |Inject `teams: "<org-name>"` for every org                                                                                                                                                                                                                                                                                                                                                 |
+|`--set-teams-file FILE`       |Inject per-org team values from `teams_map.csv`. Blank rows are skipped.                                                                                                                                                                                                                                                                                                                   |
+|`--set-teams-hybrid FILE`     |Same as `--set-teams-file` but blank rows fall back to the org name                                                                                                                                                                                                                                                                                                                        |
+|`--team-prefix PREFIX`        |Prepend `PREFIX` to every resolved teams value. Applied after `--set-teams-auto/file/hybrid`. Example: `--team-prefix "gh-"` turns `acme-dev` into `gh-acme-dev`. Orgs with no resolved teams value (blank file row on the `--set-teams-file FILE` option) are not affected.                                                                                                               |
+|`--create-teams`              |Create teams on the Veracode platform via the Identity API if they do not already exist. Uses the resolved teams value from `--set-teams-auto/file/hybrid` (after prefix). Requires `VERACODE_API_ID` and `VERACODE_API_KEY`. Must be combined with one of the `--set-teams-*` flags. See [Platform Team Creation](#platform-team-creation).                                               |
+|`--set-secrets`               |Set `VERACODE_API_ID`, `VERACODE_API_KEY`, `VERACODE_AGENT_TOKEN` per org. Always overwrites all three - safe to re-run for annual credential rotation. The SCA agent token is regenerated via `token:regenerate` on each run, invalidating the previous one.                                                                                                                              |
+|`--update-veracode-yml [FILE]`|Push a `veracode.yml` to the `veracode` repo in every org. By default fetches `veracode.yml` directly from the upstream integration repo (`github.com/veracode/github-actions-integration`). Pass a local `FILE` path to use a custom file instead. The current file is backed up as `default-veracode.yml` first. Orgs with a missing or not-yet-imported repo are skipped with a warning.|
+|`--fix-repos`                 |Compensatory pass for already-imported repos. See [Fix Existing Repos](#fix-existing-repos). Cannot be combined with `--import-repo` in the same run.                                                                                                                                                                                                                                      |
 
 ### Configuration
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--enterprise SLUG` | - | GitHub Enterprise slug for org discovery |
-| `--orgs-file FILE` | - | Plain text file, one org per line, `#` for comments. Used directly as the org scope when provided alone; used as a filter when combined with `--enterprise`. |
-| `--api-base URL` | `https://api.github.com` | Override for GHES |
-| `--web-base URL` | `https://github.com` | Override for GHES |
-| `--out DIR` | `./out` | Output directory |
-| `--skip-to ORG` | - | Skip all orgs before this one |
-| `--continue` | - | Resume from last checkpoint |
-| `--workers N` | `1` | Number of parallel worker threads. See [Parallel Execution](#parallel-execution). |
+|Flag               |Default                 |Description                                                                                                                                                 |
+|-------------------|------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|`--enterprise SLUG`|-                       |GitHub Enterprise slug for org discovery                                                                                                                    |
+|`--orgs-file FILE` |-                       |Plain text file, one org per line, `#` for comments. Used directly as the org scope when provided alone; used as a filter when combined with `--enterprise`.|
+|`--api-base URL`   |`https://api.github.com`|Override for GHES                                                                                                                                           |
+|`--web-base URL`   |`https://github.com`    |Override for GHES                                                                                                                                           |
+|`--out DIR`        |`./out`                 |Output directory                                                                                                                                            |
+|`--skip-to ORG`    |-                       |Skip all orgs before this one                                                                                                                               |
+|`--continue`       |-                       |Resume from last checkpoint                                                                                                                                 |
+|`--workers N`      |`1`                     |Number of parallel worker threads. See [Parallel Execution](#parallel-execution).                                                                           |
 
----
+-----
+
+## Actions Allowlist Check
+
+The integration only runs if your org’s GitHub Actions policy permits the actions the workflows call. On every run the script checks each org’s policy (`/orgs/{org}/actions/permissions`) and warns, without blocking, when required actions are not allowed:
+
+- **`all`** - everything permitted, passes.
+- **`local_only`** - third-party Veracode actions are blocked; flagged.
+- **`selected`** - the required patterns are verified against `patterns_allowed` (GitHub-owned `actions/*` are covered by the `github_owned_allowed` flag). Any missing pattern is flagged.
+
+Flagged orgs and their missing patterns are written to `actions_allowlist_issues.csv`. Without `admin:org` the policy cannot be read and orgs are reported as `no_permission`. To fix an org, set its Actions policy to allow all actions, or add the required patterns to the selected-actions allowlist (`Settings > Actions > General`).
+
+-----
 
 ## Fix Existing Repos
 
 `--fix-repos` operates on already-imported repos only (skips orgs where the `veracode` repo is missing or empty - use `--import-repo` for those). For each qualifying org it checks and remediates:
 
 1. **Default branch** - sets `main` as default if it is not already
-2. **`veracode.yml`** - adds or updates the file if missing (uses `--update-veracode-yml FILE` if provided, otherwise falls back to the local `veracode.yml` next to the script)
-3. **Teams injection** - injects or updates `teams:` in workflow files if a `--set-teams-*` flag is active
+1. **`veracode.yml`** - adds or updates the file if missing (uses `--update-veracode-yml FILE` if provided, otherwise falls back to the local `veracode.yml` next to the script)
+1. **Teams injection** - injects or updates `teams:` in workflow files if a `--set-teams-*` flag is active
 
-Compatible with `--dry-run` to audit without making changes. Cannot be combined with `--import-repo` in the same run.
+If `main` does not exist, or both workflow files are missing on `main`, the repo is treated as a broken import and is **re-imported from upstream** (in apply mode), after which the default branch is set and the steps above run. Compatible with `--dry-run` to audit without making changes. Cannot be combined with `--import-repo` in the same run.
 
-`default_branch_action` values in the audit report: `already_main`, `set_to_main`, `branch_not_found` (main branch not visible yet - repo may still be processing), `failed`.
+`default_branch_action` values in the audit report: `already_main`, `set_to_main`, `branch_not_found`, `failed`. `reimport_action` values: `not_needed`, `would_reimport` (dry-run), `reimported`, `git_not_available`, `reimport_main_not_visible`, `failed:<message>`.
 
----
+-----
 
 ## Platform Team Creation
 
@@ -188,8 +216,8 @@ The `--create-teams` flag provisions teams on the Veracode platform before injec
 The script uses the Veracode Identity REST API (`/api/authn/v2/teams`) to:
 
 1. Search all teams in the org for an exact name match
-2. Create the team if it does not exist
-3. Record the result (created, already_exists, or error) in the audit report
+1. Create the team if it does not exist
+1. Record the result (created, already_exists, or error) in the audit report
 
 The operation is idempotent. Re-running with the same team names is safe and will report `already_exists` for teams that were previously created.
 
@@ -216,7 +244,8 @@ python script.py --apply --enterprise YOUR-ENTERPRISE \
   --set-teams-auto --create-teams \
   --set-secrets
 ```
----
+
+-----
 
 ## Team Injection
 
@@ -252,7 +281,7 @@ The teams map is a lookup table, not a scope filter. Only orgs that are being pr
 
 > **Tip:** Combine `--set-teams-*` with `--create-teams` to ensure the team exists on the Veracode platform before it is referenced in workflow files. Without `--create-teams`, you are responsible for creating teams on the platform manually or through other automation before scans run.
 
----
+-----
 
 ## veracode.yml Configuration
 
@@ -263,7 +292,7 @@ analysis_on_platform: true
 break_build_policy_findings: false
 break_build_invalid_policy: false
 break_build_on_error: false
-policy: 'Omnicom Base Policy'
+policy: 'Veracode Recommended Medium + SCA'
 issues:
   trigger: true
   commands:
@@ -290,7 +319,7 @@ The current `veracode.yml` in each repo is preserved as `default-veracode.yml` b
 
 `--update-veracode-yml` is optional and independent of the other flags. It only appears in the mode header, per-org log line, and execution summary when it is actively used.
 
----
+-----
 
 ## Credential Rotation
 
@@ -308,28 +337,29 @@ python script.py --apply --enterprise YOUR-ENTERPRISE --set-secrets
 
 The SCA agent token (`VERACODE_AGENT_TOKEN`) is also rotated as part of this - the script calls `token:regenerate` on the existing agent for each org, which invalidates the old token and returns a fresh one.
 
----
+-----
 
 ## Organization Discovery
 
 The script resolves orgs in this order:
 
 1. **`--enterprise SLUG`** - GraphQL enterprise API (requires `read:enterprise`). If `--orgs-file` is also provided, the file is used to filter the enterprise org list down to only the listed orgs.
-2. **`--orgs-file FILE`** - explicit list used directly as the org scope, one org per line.
-3. **No flags** - falls back to `/user/orgs` (all orgs accessible to the token).
+1. **`--orgs-file FILE`** - explicit list used directly as the org scope, one org per line.
+1. **No flags** - falls back to `/user/orgs` (all orgs accessible to the token).
 
----
+-----
 
 ## Output Files
 
-| File | Description |
-|------|-------------|
-| `orgs.txt` | All discovered orgs, one per line |
-| `teams_map.csv` | Org list with blank `teams` column - fill in and pass to `--set-teams-file` |
-| `audit_report_<timestamp>.json` | Per-org result log, written incrementally (crash-safe) |
-| `missing_veracode_repo.csv` | Orgs missing the `veracode` repository |
-| `missing_workflow_app.csv` | Orgs missing the workflow app |
-| `manual_install_links.csv` | App install URLs for orgs that require manual installation |
+|File                           |Description                                                                 |
+|-------------------------------|----------------------------------------------------------------------------|
+|`orgs.txt`                     |All discovered orgs, one per line                                           |
+|`teams_map.csv`                |Org list with blank `teams` column - fill in and pass to `--set-teams-file` |
+|`audit_report_<timestamp>.json`|Per-org result log, written incrementally (crash-safe)                      |
+|`missing_veracode_repo.csv`    |Orgs missing the `veracode` repository                                      |
+|`missing_workflow_app.csv`     |Orgs missing the workflow app                                               |
+|`manual_install_links.csv`     |App install URLs for orgs that require manual installation                  |
+|`actions_allowlist_issues.csv` |Orgs whose Actions policy blocks required actions, with the missing patterns|
 
 ### Audit Report Example
 
@@ -358,6 +388,11 @@ The script resolves orgs in this order:
     "status": "already_installed",
     "installation_id": 12345678
   },
+  "actions_allowlist": {
+    "status": "selected_missing",
+    "missing": ["veracode/veracode-sca@*"],
+    "detail": "1 required action(s) not allowlisted"
+  },
   "veracode_yml_update": {
     "success": true,
     "action": "updated_with_backup"
@@ -381,9 +416,11 @@ The script resolves orgs in this order:
 
 `veracode_repo.default_branch_action` values: `already_main`, `set_to_main`, `branch_not_found`, `failed`.
 
+`actions_allowlist.status` values: `all_allowed`, `selected_ok`, `local_only`, `selected_missing`, `no_permission`, `error`.
+
 `secrets.status` values in dry-run: `all_exist`, `all_missing`, `partial`, `no_permission` (token lacks `admin:org` scope).
 
----
+-----
 
 ## Platform Notes
 
@@ -411,7 +448,7 @@ Differences from GHEC:
 
 - **Outbound access to github.com required for `--import-repo`** - the script clones from `github.com/veracode/github-actions-integration` and pushes to your GHES instance. If outbound access is blocked, mirror the template repo internally first or pre-populate the `veracode` repos manually.
 
----
+-----
 
 ## Large Deployments
 
@@ -433,7 +470,7 @@ Use `--skip-to ORG` to jump to a specific org without needing a checkpoint file.
 
 For large enterprises, combine `--workers` with `--continue` to maximize throughput with crash recovery. See [Parallel Execution](#parallel-execution).
 
----
+-----
 
 ## Parallel Execution
 
@@ -450,18 +487,33 @@ python script.py --apply --enterprise YOUR-ENTERPRISE \
 
 ### Choosing a worker count
 
-| Workers | Use case |
-|---------|----------|
-| `1` | Default. Sequential. Easiest to read logs. |
-| `3` | Safe starting point for most deployments. |
-| `5` | Recommended for large enterprises (100+ orgs). |
-| `10` | Maximum recommended. Approaches rate limit risk at peak. |
+|Workers|Use case                                                                                                                                  |
+|-------|------------------------------------------------------------------------------------------------------------------------------------------|
+|`1`    |Default. Sequential. Easiest to read logs.                                                                                                |
+|`3`    |Safe starting point for most deployments.                                                                                                 |
+|`5`    |Recommended for large enterprises (100+ orgs). Above this, additional workers stall waiting on the shared write budget.                   |
+|`10`   |Maximum recommended. The global rate limiter still keeps the run within GitHub’s limits, but extra concurrency yields diminishing returns.|
 
-GitHub's authenticated API rate limit is 5,000 requests per hour per token. Each org in a full apply run (`--import-repo --set-teams-auto --create-teams --set-secrets`) consumes roughly 18-25 API calls (the Identity API calls for `--create-teams` add 2-3 requests per org). At 5 workers processing ~10 orgs/min, a 200-org run stays well within the hourly limit. If the limit is approached, the script automatically pauses all workers until the window resets.
+The binding constraint is not raw request throughput but GitHub’s **content-creation secondary limit**: 80 writes per minute and 500 writes per hour per token. A full apply run averages ~6-7 writes per org (workflow file PUTs, secrets, default branch PATCH, etc.), so peak sustained throughput is ~70 orgs/hour regardless of worker count. The script’s global rate limiter paces all workers to stay safely below this ceiling.
 
 ### Rate limit behavior with parallel workers
 
-All workers share a single global rate limit state. When any worker receives a near-limit signal (`X-RateLimit-Remaining < 10`), it sets a shared resume timestamp and sleeps. Other workers check the shared timestamp before each request and wait if a pause is active. This prevents mass restarts once the window resets.
+The script enforces a global, multi-dimensional rate limiter shared across all workers. It tracks four windows simultaneously, each capped at a safety margin below GitHub’s documented limits:
+
+|Window                            |GitHub limit|Script’s safe target|
+|----------------------------------|------------|--------------------|
+|Primary hourly requests           |5,000/hour  |**4,000/hour** (80%)|
+|Content-creating writes per minute|80/min      |**60/min** (75%)    |
+|Content-creating writes per hour  |500/hour    |**400/hour** (80%)  |
+|Concurrent in-flight requests     |100         |**50** (50%)        |
+
+When any worker is about to exceed a window, it sleeps until the oldest event in that window ages out, then re-checks. Content limits only apply to `POST/PUT/PATCH/DELETE` requests; `GET` requests pass through unaffected by the per-minute and per-hour write windows. The reactive `X-RateLimit-Remaining` header is still inspected as a backstop, and `Retry-After` is honored on `403/429` responses that indicate a secondary rate limit was hit.
+
+The execution summary prints the limiter’s final state so you can see how close the run pushed against each ceiling:
+
+```
+Rate Limits     : 1247/4000 req in last hour, 287/400 writes in last hour, 14/60 writes in last minute
+```
 
 ### Checkpoint compatibility
 
@@ -481,18 +533,18 @@ python script.py --apply --enterprise YOUR-ENTERPRISE \
 
 Per-org log lines are printed atomically but may arrive out of order relative to the org list (this is expected). The `[N/TOTAL]` progress prefix on each line shows the submission order. The audit report always contains one entry per org regardless of completion order.
 
----
+-----
 
 ## Security Notes
 
 - Veracode admin credentials are used only for API calls and never stored anywhere
 - Admin credentials must belong to a human user account with the Administrator role
-- Service account credentials are encrypted via GitHub's public key API before being written to secrets
+- Service account credentials are encrypted via GitHub’s public key API before being written to secrets
 - Agent tokens are unique per organization and regenerated on each `--set-secrets` run
 - All credentials are passed via environment variables and never hardcoded in source
 - Default mode is read-only; all changes require explicit `--apply`
 
----
+-----
 
 ## Support
 
