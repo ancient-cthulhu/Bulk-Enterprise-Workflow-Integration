@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 from base64 import b64decode, b64encode
+from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -68,8 +69,159 @@ _REQUIRED_ACTION_PATTERNS: tuple[str, ...] = (
 _GITHUB_OWNED_PREFIX = "actions/"
 
 _print_lock = threading.Lock()
-_rate_limit_lock = threading.Lock()
-_rate_limit_pause_until: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Global rate limiter (primary + secondary GitHub limits)
+# ---------------------------------------------------------------------------
+#
+# GitHub limits this script must respect (authenticated PAT):
+#   Primary:    5,000 req/hour total.
+#   Secondary:  100 concurrent requests (REST + GraphQL combined).
+#   Secondary:  900 points/min per endpoint (GET=1, POST/PUT/PATCH/DELETE=5).
+#   Secondary:  80 content-creating requests/min, 500/hour (POST/PUT/PATCH/DELETE).
+#   Secondary:  90s CPU per 60s wall, plus undisclosed compute heuristics.
+#
+# In practice, content creation is the binding constraint: a full apply run
+# averages ~6-7 writes per org, so 500/hour caps throughput at ~70 orgs/hour
+# regardless of workers. The limiter below uses safety margins so we never
+# brush against the actual ceilings.
+
+# Safety margins (fraction of GitHub's documented limits we target):
+_SAFE_FRACTION_HOURLY = 0.80          # 4,000/hour of 5,000
+_SAFE_FRACTION_CONTENT_PER_MIN = 0.75 # 60/min of 80
+_SAFE_FRACTION_CONTENT_PER_HOUR = 0.80  # 400/hour of 500
+_SAFE_FRACTION_POINTS_PER_MIN = 0.80  # 720 points/min of 900
+
+# Concurrent in-flight cap (GitHub says 100; we cap workers to 10 already)
+_MAX_CONCURRENT_REQUESTS = 50
+
+_CONTENT_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+class _SlidingWindow:
+    """Thread-safe sliding window counter over `window_seconds`.
+
+    Uses a deque so left-side pruning during long-running sessions is O(1)
+    per removed item, rather than O(n) with list.pop(0).
+    """
+    __slots__ = ("window", "_events", "_lock")
+
+    def __init__(self, window_seconds: float) -> None:
+        self.window = window_seconds
+        self._events: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def _prune_locked(self, cutoff: float) -> None:
+        events = self._events
+        while events and events[0] < cutoff:
+            events.popleft()
+
+    def add(self) -> None:
+        now = time.time()
+        with self._lock:
+            self._events.append(now)
+            self._prune_locked(now - self.window)
+
+    def count(self) -> int:
+        cutoff = time.time() - self.window
+        with self._lock:
+            self._prune_locked(cutoff)
+            return len(self._events)
+
+    def oldest_in_window(self) -> float | None:
+        cutoff = time.time() - self.window
+        with self._lock:
+            self._prune_locked(cutoff)
+            return self._events[0] if self._events else None
+
+
+class _RateLimiter:
+    """
+    Global rate limiter shared across worker threads.
+
+    Tracks:
+      - hourly request count vs primary 5,000/hour budget
+      - content-creating writes per minute and per hour
+      - in-flight concurrent request count
+    """
+    def __init__(self) -> None:
+        self.hourly = _SlidingWindow(3600)
+        self.content_minute = _SlidingWindow(60)
+        self.content_hour = _SlidingWindow(3600)
+        self.concurrent = threading.Semaphore(_MAX_CONCURRENT_REQUESTS)
+
+        self.hourly_cap = int(5000 * _SAFE_FRACTION_HOURLY)
+        self.content_min_cap = int(80 * _SAFE_FRACTION_CONTENT_PER_MIN)
+        self.content_hour_cap = int(500 * _SAFE_FRACTION_CONTENT_PER_HOUR)
+
+        self._warn_lock = threading.Lock()
+        self._last_warn_ts: float = 0.0
+
+    def _warn(self, msg: str) -> None:
+        now = time.time()
+        with self._warn_lock:
+            if now - self._last_warn_ts < 10:
+                return
+            self._last_warn_ts = now
+        tprint(msg)
+
+    def acquire(self, method: str) -> None:
+        """Block until safe to make a request of the given method."""
+        is_content = method.upper() in _CONTENT_METHODS
+
+        # Hourly primary budget
+        while True:
+            if self.hourly.count() < self.hourly_cap:
+                break
+            oldest = self.hourly.oldest_in_window()
+            wait = max((oldest + 3600) - time.time(), 1.0) if oldest else 5.0
+            self._warn(f"  [RATE LIMIT] Hourly safe budget reached ({self.hourly_cap} req/hour). "
+                       f"Waiting {int(wait)}s.")
+            time.sleep(min(wait, 30))
+
+        if is_content:
+            # Per-minute content creation budget (the binding constraint)
+            while True:
+                if self.content_minute.count() < self.content_min_cap:
+                    break
+                oldest = self.content_minute.oldest_in_window()
+                wait = max((oldest + 60) - time.time(), 1.0) if oldest else 2.0
+                self._warn(f"  [RATE LIMIT] Content-write minute budget reached "
+                           f"({self.content_min_cap}/min). Pacing for {wait:.1f}s.")
+                time.sleep(min(wait, 10))
+
+            # Per-hour content creation budget
+            while True:
+                if self.content_hour.count() < self.content_hour_cap:
+                    break
+                oldest = self.content_hour.oldest_in_window()
+                wait = max((oldest + 3600) - time.time(), 1.0) if oldest else 30.0
+                self._warn(f"  [RATE LIMIT] Content-write hourly budget reached "
+                           f"({self.content_hour_cap}/hour). Waiting {int(wait)}s.")
+                time.sleep(min(wait, 60))
+
+        self.concurrent.acquire()
+        self.hourly.add()
+        if is_content:
+            self.content_minute.add()
+            self.content_hour.add()
+
+    def release(self) -> None:
+        self.concurrent.release()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "requests_last_hour": self.hourly.count(),
+            "hourly_cap": self.hourly_cap,
+            "content_writes_last_minute": self.content_minute.count(),
+            "content_min_cap": self.content_min_cap,
+            "content_writes_last_hour": self.content_hour.count(),
+            "content_hour_cap": self.content_hour_cap,
+        }
+
+
+_rate_limiter = _RateLimiter()
 
 
 # ---------------------------------------------------------------------------
@@ -265,37 +417,34 @@ def gh_headers(token: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def check_rate_limit(response: requests.Response) -> None:
-    global _rate_limit_pause_until
-
+    """
+    Reactive check based on GitHub's response headers. The proactive
+    _rate_limiter handles steady-state pacing; this catches edge cases where
+    GitHub's reported remaining is lower than our local estimate (other tools
+    sharing the token, or undisclosed secondary budgets).
+    """
     remaining_hdr = response.headers.get("X-RateLimit-Remaining")
     reset_hdr = response.headers.get("X-RateLimit-Reset")
     if not remaining_hdr or not reset_hdr:
         return
 
-    remaining = int(remaining_hdr)
-    reset_time = int(reset_hdr)
+    try:
+        remaining = int(remaining_hdr)
+        reset_time = int(reset_hdr)
+    except ValueError:
+        return
 
-    if remaining < 100 and remaining % 10 == 0:
+    if remaining < 200 and remaining % 50 == 0:
         reset_dt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reset_time))
-        tprint(f"  [WARNING] Rate limit low: {remaining} requests remaining (resets at {reset_dt})")
+        tprint(f"  [INFO] Primary rate limit: {remaining} requests remaining (resets at {reset_dt})")
 
-    if remaining < 10:
-        with _rate_limit_lock:
-            now = time.time()
-            wait_seconds = max(reset_time - int(now), 0) + 5
-            resume_at = now + wait_seconds
-            if resume_at > _rate_limit_pause_until:
-                _rate_limit_pause_until = resume_at
-                tprint(f"  [RATE LIMIT] Pausing {wait_seconds}s until rate limit resets...")
-            else:
-                wait_seconds = max(_rate_limit_pause_until - now, 0)
+    # Hard backstop: GitHub says we're almost out. Pause until reset.
+    if remaining < 50:
+        wait_seconds = max(reset_time - int(time.time()), 0) + 5
         if wait_seconds > 0:
-            time.sleep(wait_seconds)
-    else:
-        with _rate_limit_lock:
-            pause = max(_rate_limit_pause_until - time.time(), 0)
-        if pause > 0:
-            time.sleep(pause)
+            tprint(f"  [RATE LIMIT] GitHub reports {remaining} remaining; sleeping {wait_seconds}s "
+                   f"until window reset to be safe.")
+            time.sleep(min(wait_seconds, 300))
 
 
 # ---------------------------------------------------------------------------
@@ -312,10 +461,17 @@ def _retry_request(
     for attempt in range(max_retries):
         try:
             r = make_request()
-            if r.status_code == 429:
+
+            is_secondary = (
+                r.status_code in (403, 429)
+                and "secondary rate limit" in (r.text or "").lower()
+            )
+
+            if r.status_code == 429 or is_secondary:
                 retry_after = int(r.headers.get("Retry-After", 60))
                 if attempt < max_retries - 1:
-                    tprint(f"  [{label}] 429, waiting {retry_after}s (retry {attempt + 1}/{max_retries})...")
+                    kind = "secondary rate limit" if is_secondary else "429"
+                    tprint(f"  [{label}] {kind}, waiting {retry_after}s (retry {attempt + 1}/{max_retries})...")
                     time.sleep(retry_after)
                     continue
                 return r
@@ -340,7 +496,11 @@ def _retry_request(
 
 def request(method: str, url: str, token: str, max_retries: int = 3, **kwargs: Any) -> requests.Response:
     def make() -> requests.Response:
-        r = requests.request(method, url, headers=gh_headers(token), timeout=45, **kwargs)
+        _rate_limiter.acquire(method)
+        try:
+            r = requests.request(method, url, headers=gh_headers(token), timeout=45, **kwargs)
+        finally:
+            _rate_limiter.release()
         check_rate_limit(r)
         return r
     return _retry_request(make, "GITHUB", max_retries)
@@ -2293,8 +2453,10 @@ def main() -> None:
         print("ERROR: --workers must be at least 1.", file=sys.stderr)
         sys.exit(1)
     if args.workers > 10:
-        print(f"[WARNING] --workers {args.workers} is high. GitHub API rate limit is 5,000 req/hour. "
-              "Consider 3-5 workers to avoid exhaustion.")
+        print(f"[WARNING] --workers {args.workers} is high. The global rate limiter will pace "
+              "writes to stay within content-creation limits (~60 writes/min, ~400 writes/hour), "
+              "so extra workers above ~5 give diminishing returns and may stall waiting on the "
+              "shared budget. Consider 3-5 workers.")
 
     if not args.dry_run and not args.apply:
         args.dry_run = True
@@ -2725,6 +2887,11 @@ def main() -> None:
         secrets_total = st.secrets_success + st.secrets_fail
         secrets_pct = (st.secrets_success / secrets_total) * 100
         print(f"Secrets         : {st.secrets_success} success, {st.secrets_fail} failed ({secrets_pct:.1f}% success)")
+
+    snap = _rate_limiter.snapshot()
+    print(f"Rate Limits     : {snap['requests_last_hour']}/{snap['hourly_cap']} req in last hour, "
+          f"{snap['content_writes_last_hour']}/{snap['content_hour_cap']} writes in last hour, "
+          f"{snap['content_writes_last_minute']}/{snap['content_min_cap']} writes in last minute")
 
     print(f"{'=' * 70}")
     print("\nOutputs written to:", outdir.resolve())
