@@ -326,6 +326,9 @@ class RunStats:
     teams_created_on_platform: int = 0
     teams_already_exist_on_platform: int = 0
     teams_create_failed_on_platform: int = 0
+    teams_linked_to_workspace: int = 0
+    teams_link_already: int = 0
+    teams_link_failed: int = 0
     default_branch_fixed: int = 0
     default_branch_ok: int = 0
     default_branch_failed: int = 0
@@ -354,6 +357,7 @@ class RunContext:
     do_update_yml: bool
     do_create_teams: bool
     do_fix_repos: bool
+    do_link_teams: bool
     dry_run: bool
     teams_mode: Literal["auto", "file", "hybrid", "none"]
     yml_content: str | None
@@ -387,6 +391,9 @@ class RunContext:
         if self.do_create_teams:
             if not self.veracode_api_id or not self.veracode_api_key:
                 raise ValueError("do_create_teams requires veracode_api_id and veracode_api_key")
+        if self.do_link_teams:
+            if not self.veracode_api_id or not self.veracode_api_key:
+                raise ValueError("do_link_teams requires veracode_api_id and veracode_api_key")
 
 
 # ---------------------------------------------------------------------------
@@ -921,6 +928,74 @@ def ensure_veracode_team(
     if new_id:
         return new_id, "created"
     return None, "error"
+
+
+# ---------------------------------------------------------------------------
+# Veracode SCA API - Team <-> Workspace association
+# ---------------------------------------------------------------------------
+
+def add_team_to_workspace(
+    workspace_id: str,
+    team_id: str,
+    api_id: str,
+    api_key: str,
+    log: Callable[[str], None] = tprint,
+) -> tuple[bool, str]:
+    """
+    Associate a Veracode team with an SCA agent-based workspace so the team can
+    see that workspace's scan results. Idempotent: PUT re-adds cleanly.
+
+    Returns (success, action): 'linked' | 'already_linked' | 'error'.
+
+    NOTE: confirm the endpoint path against the SCA Agent API spec for your
+    tenant. The path below follows the existing /srcclr/v3/workspaces/{id}/...
+    convention used elsewhere in this script.
+    """
+    try:
+        r = veracode_request(
+            "PUT",
+            f"/srcclr/v3/workspaces/{workspace_id}/teams/{team_id}",
+            api_id, api_key,
+        )
+        if r.status_code in (200, 201, 204):
+            return True, "linked"
+        if r.status_code == 409:
+            return True, "already_linked"
+        log(f"  [ERROR] Link team {team_id} -> workspace {workspace_id}: "
+            f"{r.status_code} - {r.text[:200]}")
+        return False, "error"
+    except Exception as exc:
+        log(f"  [ERROR] add_team_to_workspace: {exc}")
+        return False, "error"
+
+
+def ensure_team_linked_to_workspace(
+    org_name: str,
+    team_name: str,
+    api_id: str,
+    api_key: str,
+    workspace_id: str | None = None,
+    team_id: str | None = None,
+    log: Callable[[str], None] = tprint,
+) -> tuple[bool, str]:
+    """
+    Link `team_name` to the SCA workspace named `org_name`. Resolves the
+    workspace and team IDs by name if they were not already captured this run,
+    so this works as a standalone pass against pre-existing workspaces/teams.
+    Creates neither the workspace nor the team.
+
+    Returns (success, action), adding 'workspace_not_found' | 'team_not_found'
+    to the set returned by add_team_to_workspace.
+    """
+    if not workspace_id:
+        workspace_id = _find_workspace_by_name(org_name, api_id, api_key, log)
+        if not workspace_id:
+            return False, "workspace_not_found"
+    if not team_id:
+        team_id = _find_veracode_team_by_name(team_name, api_id, api_key, log)
+        if not team_id:
+            return False, "team_not_found"
+    return add_team_to_workspace(workspace_id, team_id, api_id, api_key, log)
 
 
 # ---------------------------------------------------------------------------
@@ -1984,6 +2059,11 @@ def process_org(
     else:
         teams_value = None
 
+    # IDs captured during this run so the team<->workspace link step can reuse
+    # them instead of re-resolving by name.
+    captured_team_id: str | None = None
+    captured_workspace_id: str | None = None
+
     # --- Fix existing repos (compensatory pass) -------------------------------
     if ctx.do_fix_repos:
         try:
@@ -2099,6 +2179,7 @@ def process_org(
             team_id, team_action = ensure_veracode_team(
                 teams_value, ctx.veracode_api_id, ctx.veracode_api_key, log=buf.add,
             )
+            captured_team_id = team_id
             entry["veracode_team_platform"] = {
                 "team_name": teams_value,
                 "team_id": team_id,
@@ -2253,6 +2334,7 @@ def process_org(
                 workspace_id = create_veracode_workspace(
                     org, ctx.veracode_api_id, ctx.veracode_api_key, log=buf.add,
                 )
+                captured_workspace_id = workspace_id
                 if not workspace_id:
                     entry["secrets"] = {"status": "error", "error": "Failed to create or find Veracode workspace"}
                     with ctx.stats_lock:
@@ -2284,6 +2366,40 @@ def process_org(
                 if ctx.dry_run:
                     ctx.stats.secrets_checked += 1
             buf.add(f"  Secrets error: {str(exc)[:80]}")
+
+    # --- Link team to SCA workspace (independent, idempotent) -----------------
+    if ctx.do_link_teams and teams_value and ctx.veracode_api_id and ctx.veracode_api_key:
+        try:
+            link_ok, link_action = ensure_team_linked_to_workspace(
+                org_name=org,
+                team_name=teams_value,
+                api_id=ctx.veracode_api_id,
+                api_key=ctx.veracode_api_key,
+                workspace_id=captured_workspace_id,
+                team_id=captured_team_id,
+                log=buf.add,
+            )
+            entry["veracode_team_workspace_link"] = {
+                "workspace": org,
+                "team_name": teams_value,
+                "action": link_action,
+            }
+            with ctx.stats_lock:
+                if link_action == "linked":
+                    ctx.stats.teams_linked_to_workspace += 1
+                elif link_action == "already_linked":
+                    ctx.stats.teams_link_already += 1
+                else:
+                    ctx.stats.teams_link_failed += 1
+        except Exception as exc:
+            entry["veracode_team_workspace_link"] = {
+                "workspace": org,
+                "team_name": teams_value,
+                "action": f"error:{exc}",
+            }
+            with ctx.stats_lock:
+                ctx.stats.teams_link_failed += 1
+            buf.add(f"  Team->workspace link error: {str(exc)[:80]}")
 
     # --- Write report + checkpoint --------------------------------------------
     with ctx.report_lock:
@@ -2347,6 +2463,12 @@ def process_org(
             pt_action = pt_info.get("action", "")
             platform_team_detail = f" PlatformTeam: [{pt_action}]"
 
+    link_detail = ""
+    if ctx.do_link_teams:
+        lk = entry.get("veracode_team_workspace_link", {})
+        if lk:
+            link_detail = f" Link: [{lk.get('action', '')}]"
+
     yml_status = ""
     if ctx.do_update_yml:
         yml_info = entry.get("veracode_yml_update", {})
@@ -2374,7 +2496,7 @@ def process_org(
         else:
             secrets_status = "  Secrets: [FAIL]"
 
-    buf.add(f"  Repo: {repo_status}{teams_detail}{platform_team_detail}  App: {app_status}{yml_status}{secrets_status}")
+    buf.add(f"  Repo: {repo_status}{teams_detail}{platform_team_detail}{link_detail}  App: {app_status}{yml_status}{secrets_status}")
 
 
 # ---------------------------------------------------------------------------
@@ -2404,6 +2526,13 @@ def main() -> None:
     ap.add_argument("--create-teams", action="store_true",
                     help="[apply] Create teams on the Veracode platform (Identity API) if they "
                          "do not already exist. Requires VERACODE_API_ID and VERACODE_API_KEY.")
+
+    ap.add_argument("--link-teams-to-workspaces", action="store_true",
+                    help="[apply] Associate each org's team with its SCA workspace so the team "
+                         "can see scan results. Resolves workspace by org name and team by teams "
+                         "value; creates neither. Requires VERACODE_API_ID and VERACODE_API_KEY "
+                         "and an active teams mode (--set-teams-*). Composes with --create-teams "
+                         "and --set-secrets.")
 
     ap.add_argument("--set-secrets", action="store_true",
                     help="[apply] Set VERACODE_API_ID, VERACODE_API_KEY, VERACODE_AGENT_TOKEN. "
@@ -2485,6 +2614,7 @@ def main() -> None:
     do_set_teams = bool(args.apply and (args.set_teams_auto or args.set_teams_file or args.set_teams_hybrid))
     do_update_yml = bool(args.apply and args.update_veracode_yml is not None)
     do_create_teams = bool(args.apply and args.create_teams and (args.set_teams_auto or args.set_teams_file or args.set_teams_hybrid))
+    do_link_teams = bool(args.apply and args.link_teams_to_workspaces and (args.set_teams_auto or args.set_teams_file or args.set_teams_hybrid))
     do_fix_repos = bool(args.fix_repos)
 
     if args.set_teams_auto:
@@ -2531,7 +2661,7 @@ def main() -> None:
         if yml_source_label:
             print(f"[update-veracode-yml] Source: {yml_source_label}")
 
-    need_veracode_creds = do_set_secrets or do_create_teams
+    need_veracode_creds = do_set_secrets or do_create_teams or do_link_teams
     veracode_api_id = env("VERACODE_API_ID") if need_veracode_creds else None
     veracode_api_key = env("VERACODE_API_KEY") if need_veracode_creds else None
     veracode_sa_api_id = env("VERACODE_SA_API_ID") if do_set_secrets else None
@@ -2546,6 +2676,14 @@ def main() -> None:
     if do_create_teams and (not veracode_api_id or not veracode_api_key):
         print("ERROR: --create-teams requires VERACODE_API_ID and VERACODE_API_KEY env vars "
               "(human user account with Administrator role).", file=sys.stderr)
+        sys.exit(1)
+    if args.apply and args.link_teams_to_workspaces and teams_mode == "none":
+        print("ERROR: --link-teams-to-workspaces requires a teams mode "
+              "(--set-teams-auto/-file/-hybrid).", file=sys.stderr)
+        sys.exit(1)
+    if do_link_teams and (not veracode_api_id or not veracode_api_key):
+        print("ERROR: --link-teams-to-workspaces requires VERACODE_API_ID and "
+              "VERACODE_API_KEY env vars.", file=sys.stderr)
         sys.exit(1)
 
     teams_map: dict[str, str] = {}
@@ -2583,6 +2721,8 @@ def main() -> None:
                 print(f"    Team prefix         : '{args.team_prefix}'")
         if do_create_teams:
             print("  Create platform teams : YES (via Veracode Identity API)")
+        if do_link_teams:
+            print("  Link teams->workspaces: YES (via Veracode SCA API)")
         if do_update_yml:
             print(f"  Update veracode.yml   : YES (source: {yml_source_label})")
         print(f"  Set Veracode secrets  : {'YES' if do_set_secrets else 'NO (--set-secrets)'}")
@@ -2644,7 +2784,7 @@ def main() -> None:
         token=token,
         veracode_api_id=veracode_api_id,
         veracode_api_key=veracode_api_key,
-        check_veracode=do_set_secrets or do_create_teams,
+        check_veracode=do_set_secrets or do_create_teams or do_link_teams,
     )
     if not validation_ok:
         print("\n[ERROR] Credential validation failed:", file=sys.stderr)
@@ -2701,6 +2841,8 @@ def main() -> None:
             print("  - Create and import veracode repos")
         if do_create_teams:
             print("  - Create teams on Veracode platform via Identity API")
+        if do_link_teams:
+            print("  - Link teams to SCA workspaces on Veracode platform")
         if do_set_teams:
             print("  - Inject/update teams parameters into workflows")
         if do_update_yml:
@@ -2726,6 +2868,7 @@ def main() -> None:
         do_update_yml=do_update_yml,
         do_create_teams=do_create_teams,
         do_fix_repos=do_fix_repos,
+        do_link_teams=do_link_teams,
         dry_run=args.dry_run,
         teams_mode=teams_mode,
         yml_content=yml_content,
@@ -2867,6 +3010,12 @@ def main() -> None:
         print(f"Platform Teams  : {st.teams_created_on_platform} created, "
               f"{st.teams_already_exist_on_platform} already exist, "
               f"{st.teams_create_failed_on_platform} failed (of {pt_total} orgs)")
+
+    if do_link_teams:
+        link_total = st.teams_linked_to_workspace + st.teams_link_already + st.teams_link_failed
+        print(f"Team<->Workspace: {st.teams_linked_to_workspace} linked, "
+              f"{st.teams_link_already} already linked, "
+              f"{st.teams_link_failed} failed (of {link_total} orgs)")
 
     if do_set_teams:
         teams_total = st.teams_updated + st.teams_skipped + st.teams_failed
