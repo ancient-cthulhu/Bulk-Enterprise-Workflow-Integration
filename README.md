@@ -1,6 +1,6 @@
 # Veracode Bulk GitHub Workflow Integration
 
-Deploys Veracode security scanning across GitHub Enterprise organizations at scale. Handles repository creation, workflow configuration, team assignments, Veracode platform team provisioning, app installation, and secrets management with audit trails, checkpoint/resume support, and parallel execution.
+Deploys Veracode security scanning across GitHub Enterprise organizations at scale. Handles repository creation, workflow configuration, team assignments, Veracode platform team provisioning, team-to-workspace linking, app installation, and secrets management with audit trails, checkpoint/resume support, and parallel execution.
 
 -----
 
@@ -13,6 +13,7 @@ For each organization, the script can:
 1. Create teams on the Veracode platform via the Identity API (if they do not already exist)
 1. Inject `teams:` parameter into workflow files
 1. Create a Veracode SCA workspace, generate a unique agent token, and set GitHub Actions secrets
+1. Link each org's team to its SCA workspace so the team can see scan results (`--link-teams-to-workspaces`)
 
 All operations are idempotent, safe to re-run. If a repo import completes after the script times out, the next run detects the incomplete state via the absence of `default-veracode.yml` and automatically applies the missing post-import steps.
 
@@ -76,7 +77,8 @@ python script.py --apply \
   --import-repo \
   --set-teams-file out/teams_map.csv \
   --create-teams \
-  --set-secrets
+  --set-secrets \
+  --link-teams-to-workspaces
 ```
 
 ### Phase 3 - Fix existing repos (compensatory pass)
@@ -115,10 +117,10 @@ Two credential pairs serve different purposes:
 
 |Variable             |Purpose                                                                                            |Account Type                                          |
 |---------------------|---------------------------------------------------------------------------------------------------|------------------------------------------------------|
-|`VERACODE_API_ID`    |Admin - used by the script to call Veracode APIs (create workspaces, generate tokens, create teams)|**Human user account** with the **Administrator** role|
+|`VERACODE_API_ID`    |Admin - used by the script to call Veracode APIs (create workspaces, generate tokens, create teams, link teams to workspaces)|**Human user account** with the **Administrator** role|
 |`VERACODE_API_KEY`   |Admin                                                                                              |Same as above                                         |
-|`VERACODE_SA_API_ID` |Service account - stored as `VERACODE_API_ID` in each org’s Actions secrets                        |API service account                                   |
-|`VERACODE_SA_API_KEY`|Service account - stored as `VERACODE_API_KEY` in each org’s Actions secrets                       |API service account                                   |
+|`VERACODE_SA_API_ID` |Service account - stored as `VERACODE_API_ID` in each org's Actions secrets                        |API service account                                   |
+|`VERACODE_SA_API_KEY`|Service account - stored as `VERACODE_API_KEY` in each org's Actions secrets                       |API service account                                   |
 
 **Important:** The admin credentials (`VERACODE_API_ID` / `VERACODE_API_KEY`) must belong to a **human user account** with the **Administrator** role on the Veracode platform. API service accounts do not have sufficient permissions for the Identity API operations used by `--create-teams` and `--set-secrets`. The Identity API requires either a human user with the Administrator role or an API service account with the Admin API role, but workspace and agent token operations require a human administrator.
 
@@ -126,14 +128,15 @@ Admin credentials are never stored in any org. Service account credentials are w
 
 ### Which flags need which credentials
 
-|Flag                   |Requires `VERACODE_API_ID/KEY`|Requires `VERACODE_SA_API_ID/KEY`|
-|-----------------------|------------------------------|---------------------------------|
-|`--create-teams`       |Yes                           |No                               |
-|`--set-secrets`        |Yes                           |Yes                              |
-|`--import-repo`        |No                            |No                               |
-|`--set-teams-*`        |No                            |No                               |
-|`--update-veracode-yml`|No                            |No                               |
-|`--fix-repos`          |No                            |No                               |
+|Flag                          |Requires `VERACODE_API_ID/KEY`|Requires `VERACODE_SA_API_ID/KEY`|
+|------------------------------|------------------------------|---------------------------------|
+|`--create-teams`              |Yes                           |No                               |
+|`--set-secrets`               |Yes                           |Yes                              |
+|`--link-teams-to-workspaces`  |Yes                           |No                               |
+|`--import-repo`               |No                            |No                               |
+|`--set-teams-*`               |No                            |No                               |
+|`--update-veracode-yml`       |No                            |No                               |
+|`--fix-repos`                 |No                            |No                               |
 
 -----
 
@@ -147,6 +150,7 @@ Admin credentials are never stored in any org. Service account credentials are w
 |`--update-veracode-yml`          |+ `repo`, `workflow`                                                                                                                                   |
 |`--fix-repos`                    |+ `repo`, `workflow`                                                                                                                                   |
 |`--set-secrets`                  |`admin:org` *(already covered above)*                                                                                                                  |
+|`--link-teams-to-workspaces`     |None beyond base. The link step calls the Veracode SCA API only; it adds no GitHub scope requirement.                                                   |
 
 Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`, `workflow`
 
@@ -165,6 +169,7 @@ Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`,
 |`--team-prefix PREFIX`        |Prepend `PREFIX` to every resolved teams value. Applied after `--set-teams-auto/file/hybrid`. Example: `--team-prefix "gh-"` turns `acme-dev` into `gh-acme-dev`. Orgs with no resolved teams value (blank file row on the `--set-teams-file FILE` option) are not affected.                                                                                                               |
 |`--create-teams`              |Create teams on the Veracode platform via the Identity API if they do not already exist. Uses the resolved teams value from `--set-teams-auto/file/hybrid` (after prefix). Requires `VERACODE_API_ID` and `VERACODE_API_KEY`. Must be combined with one of the `--set-teams-*` flags. See [Platform Team Creation](#platform-team-creation).                                               |
 |`--set-secrets`               |Set `VERACODE_API_ID`, `VERACODE_API_KEY`, `VERACODE_AGENT_TOKEN` per org. Always overwrites all three - safe to re-run for annual credential rotation. The SCA agent token is regenerated via `token:regenerate` on each run, invalidating the previous one.                                                                                                                              |
+|`--link-teams-to-workspaces`  |Associate each org's team with its SCA workspace so the team can see scan results. Resolves the workspace by org name and the team by the resolved teams value (after prefix); creates neither. Requires `VERACODE_API_ID` and `VERACODE_API_KEY` and one of the `--set-teams-*` flags. Composes with `--create-teams` and `--set-secrets`. See [Link Teams to Workspaces](#link-teams-to-workspaces).|
 |`--update-veracode-yml [FILE]`|Push a `veracode.yml` to the `veracode` repo in every org. By default fetches `veracode.yml` directly from the upstream integration repo (`github.com/veracode/github-actions-integration`). Pass a local `FILE` path to use a custom file instead. The current file is backed up as `default-veracode.yml` first. Orgs with a missing or not-yet-imported repo are skipped with a warning.|
 |`--fix-repos`                 |Compensatory pass for already-imported repos. See [Fix Existing Repos](#fix-existing-repos). Cannot be combined with `--import-repo` in the same run.                                                                                                                                                                                                                                      |
 
@@ -185,7 +190,7 @@ Full rollout with all flags: `read:org`, `admin:org`, `read:enterprise`, `repo`,
 
 ## Actions Allowlist Check
 
-The integration only runs if your org’s GitHub Actions policy permits the actions the workflows call. On every run the script checks each org’s policy (`/orgs/{org}/actions/permissions`) and warns, without blocking, when required actions are not allowed:
+The integration only runs if your org's GitHub Actions policy permits the actions the workflows call. On every run the script checks each org's policy (`/orgs/{org}/actions/permissions`) and warns, without blocking, when required actions are not allowed:
 
 - **`all`** - everything permitted, passes.
 - **`local_only`** - third-party Veracode actions are blocked; flagged.
@@ -238,12 +243,63 @@ python script.py --apply --enterprise YOUR-ENTERPRISE \
 python script.py --apply --enterprise YOUR-ENTERPRISE \
   --set-teams-file out/teams_map.csv --team-prefix "gh-" --create-teams
 
-# Full rollout: repo + platform teams + workflow injection + secrets
+# Full rollout: repo + platform teams + workflow injection + secrets + workspace link
 python script.py --apply --enterprise YOUR-ENTERPRISE \
   --import-repo \
   --set-teams-auto --create-teams \
-  --set-secrets
+  --set-secrets \
+  --link-teams-to-workspaces
 ```
+
+-----
+
+## Link Teams to Workspaces
+
+The `--link-teams-to-workspaces` flag associates each org's Veracode team with its agent-based SCA workspace. By default, scan results in an agent-based workspace are visible only to members of that workspace; adding a team grants that team visibility into the results. This is the SCA REST API equivalent of the platform's **Software Composition Analysis > Agent-Based Scan > Manage Workspace > Teams > Add Teams** action.
+
+The flag creates neither the workspace nor the team. It resolves:
+
+- the **workspace** by org name (the same name `--set-secrets` uses when creating it)
+- the **team** by the resolved teams value, after `--team-prefix` (the same name `--create-teams` uses)
+
+then issues an idempotent association. Re-running is safe and reports `already_linked` for teams already on the workspace.
+
+### Endpoint note
+
+Confirm the endpoint against the SCA Agent API specification for your tenant before a fleet-wide run. The script uses `PUT /srcclr/v3/workspaces/{workspace_id}/teams/{team_id}`, following the existing `/srcclr/v3/workspaces/{id}/...` convention used elsewhere in the script. The path is isolated in a single helper so it is trivial to adjust if your tenant's spec differs.
+
+### Credential requirements
+
+Requires `VERACODE_API_ID` and `VERACODE_API_KEY` (human user account with the Administrator role). It does not use the service account credentials. Must be combined with one of the `--set-teams-*` flags so the script knows which team name to resolve per org. Running it with no teams mode active is rejected at startup.
+
+### How it composes
+
+- **In the full chain** (`--create-teams` and `--set-secrets` in the same run), the team and workspace IDs created earlier in the run are reused directly, so the link step makes no extra lookups.
+- **Run alone**, the link step resolves both IDs by name. The workspace must already exist, from a prior `--set-secrets` run or manual creation, otherwise the org is reported as `workspace_not_found`. A missing team is reported as `team_not_found`.
+
+The link step calls the Veracode SCA API only, so it does not count against GitHub's content-creation rate limit. See [Parallel Execution](#parallel-execution).
+
+### Usage
+
+```bash
+# Full chain: create team, create workspace + secrets, then link them
+python script.py --apply --enterprise YOUR-ENTERPRISE \
+  --set-teams-auto --create-teams --set-secrets --link-teams-to-workspaces
+
+# Link only, against workspaces and teams that already exist
+python script.py --apply --enterprise YOUR-ENTERPRISE \
+  --set-teams-file out/teams_map.csv --team-prefix "gh-" --link-teams-to-workspaces
+```
+
+`veracode_team_workspace_link.action` values: `linked`, `already_linked`, `workspace_not_found`, `team_not_found`, `error`.
+
+The execution summary prints a `Team<->Workspace` line when the flag is active:
+
+```
+Team<->Workspace: 142 linked, 11 already linked, 3 failed (of 156 orgs)
+```
+
+> **Note:** The team name and the workspace name are resolved independently, the team from the resolved teams value (after prefix) and the workspace from the org name. If you use `--team-prefix`, the team is `gh-acme-dev` while the workspace remains `acme-dev`; the link step handles this correctly because it looks each up by its own name.
 
 -----
 
@@ -280,6 +336,10 @@ python script.py --apply --enterprise YOUR-ENTERPRISE \
 The teams map is a lookup table, not a scope filter. Only orgs that are being processed (determined by `--enterprise`, `--orgs-file`, or `/user/orgs`) will be touched. If your orgs file has 1 org and your teams map has 100 entries, only the 1 org gets processed using its matching entry from the map if one exists.
 
 > **Tip:** Combine `--set-teams-*` with `--create-teams` to ensure the team exists on the Veracode platform before it is referenced in workflow files. Without `--create-teams`, you are responsible for creating teams on the platform manually or through other automation before scans run.
+
+> **Tip:** Add `--link-teams-to-workspaces` alongside `--create-teams` and `--set-secrets` to grant the team visibility into its SCA workspace results in the same run. Without it, agent-based scan results stay visible only to existing workspace members until you add teams manually. See [Link Teams to Workspaces](#link-teams-to-workspaces).
+
+> **Note on comma-separated values:** A `teams` value may contain multiple comma-separated names for workflow injection. `--create-teams` and `--link-teams-to-workspaces` treat the whole value as a single team name (matching the existing team-creation behavior); they do not split it into separate teams. Use single team names per org if you rely on platform team creation or workspace linking.
 
 -----
 
@@ -404,11 +464,18 @@ The script resolves orgs in this order:
       "VERACODE_API_KEY": "set",
       "VERACODE_AGENT_TOKEN": "set"
     }
+  },
+  "veracode_team_workspace_link": {
+    "workspace": "acme-dev",
+    "team_name": "gh-acme-dev",
+    "action": "linked"
   }
 }
 ```
 
 `veracode_team_platform.action` values: `already_exists`, `created`, `error`.
+
+`veracode_team_workspace_link.action` values: `linked`, `already_linked`, `workspace_not_found`, `team_not_found`, `error`.
 
 `veracode_yml_update.action` values: `updated_with_backup`, `created`, `repo_not_found`, `repo_empty`, `put_failed:<status_code>`.
 
@@ -430,7 +497,7 @@ All features supported.
 
 ```bash
 python script.py --apply --import-repo --set-teams-auto --create-teams \
-  --set-secrets \
+  --set-secrets --link-teams-to-workspaces \
   --enterprise your-enterprise-slug
 ```
 
@@ -438,7 +505,7 @@ python script.py --apply --import-repo --set-teams-auto --create-teams \
 
 ```bash
 python script.py --apply --import-repo --set-teams-file out/teams_map.csv --create-teams \
-  --set-secrets \
+  --set-secrets --link-teams-to-workspaces \
   --enterprise your-enterprise-slug \
   --api-base https://github.company.com/api/v3 \
   --web-base https://github.company.com
@@ -447,6 +514,7 @@ python script.py --apply --import-repo --set-teams-file out/teams_map.csv --crea
 Differences from GHEC:
 
 - **Outbound access to github.com required for `--import-repo`** - the script clones from `github.com/veracode/github-actions-integration` and pushes to your GHES instance. If outbound access is blocked, mirror the template repo internally first or pre-populate the `veracode` repos manually.
+- **Outbound access to `api.veracode.com` required** for `--create-teams`, `--set-secrets`, and `--link-teams-to-workspaces`, regardless of the GHES endpoint. These steps always call the Veracode platform, not your GHES instance.
 
 -----
 
@@ -457,11 +525,11 @@ For deployments across many orgs, use `--continue` to resume after interruption:
 ```bash
 # Initial run
 python script.py --apply --enterprise YOUR-ENTERPRISE \
-  --import-repo --set-teams-auto --create-teams --set-secrets
+  --import-repo --set-teams-auto --create-teams --set-secrets --link-teams-to-workspaces
 
 # Resume after interruption
 python script.py --apply --enterprise YOUR-ENTERPRISE \
-  --import-repo --set-teams-auto --create-teams --set-secrets --continue
+  --import-repo --set-teams-auto --create-teams --set-secrets --link-teams-to-workspaces --continue
 ```
 
 Checkpoint state is saved to `out/checkpoint.json` after each org completes. If the script is interrupted mid-org, `--continue` restarts from that org so nothing is skipped. All operations are idempotent so re-running a completed org is safe. The `--continue` flag also skips the confirmation prompt - confirmation was already given on the initial run.
@@ -482,7 +550,8 @@ python script.py --dry-run --enterprise YOUR-ENTERPRISE --workers 5
 
 # Apply with 5 workers - fastest safe setting for most token budgets
 python script.py --apply --enterprise YOUR-ENTERPRISE \
-  --import-repo --set-teams-auto --create-teams --set-secrets --workers 5
+  --import-repo --set-teams-auto --create-teams --set-secrets \
+  --link-teams-to-workspaces --workers 5
 ```
 
 ### Choosing a worker count
@@ -492,15 +561,15 @@ python script.py --apply --enterprise YOUR-ENTERPRISE \
 |`1`    |Default. Sequential. Easiest to read logs.                                                                                                |
 |`3`    |Safe starting point for most deployments.                                                                                                 |
 |`5`    |Recommended for large enterprises (100+ orgs). Above this, additional workers stall waiting on the shared write budget.                   |
-|`10`   |Maximum recommended. The global rate limiter still keeps the run within GitHub’s limits, but extra concurrency yields diminishing returns.|
+|`10`   |Maximum recommended. The global rate limiter still keeps the run within GitHub's limits, but extra concurrency yields diminishing returns.|
 
-The binding constraint is not raw request throughput but GitHub’s **content-creation secondary limit**: 80 writes per minute and 500 writes per hour per token. A full apply run averages ~6-7 writes per org (workflow file PUTs, secrets, default branch PATCH, etc.), so peak sustained throughput is ~70 orgs/hour regardless of worker count. The script’s global rate limiter paces all workers to stay safely below this ceiling.
+The binding constraint is not raw request throughput but GitHub's **content-creation secondary limit**: 80 writes per minute and 500 writes per hour per token. A full apply run averages ~6-7 writes per org (workflow file PUTs, secrets, default branch PATCH, etc.), so peak sustained throughput is ~70 orgs/hour regardless of worker count. The script's global rate limiter paces all workers to stay safely below this ceiling. Veracode API calls (team creation, workspace and token operations, team-to-workspace linking) go to `api.veracode.com` and do not count against the GitHub write budget.
 
 ### Rate limit behavior with parallel workers
 
-The script enforces a global, multi-dimensional rate limiter shared across all workers. It tracks four windows simultaneously, each capped at a safety margin below GitHub’s documented limits:
+The script enforces a global, multi-dimensional rate limiter shared across all workers. It tracks four windows simultaneously, each capped at a safety margin below GitHub's documented limits:
 
-|Window                            |GitHub limit|Script’s safe target|
+|Window                            |GitHub limit|Script's safe target|
 |----------------------------------|------------|--------------------|
 |Primary hourly requests           |5,000/hour  |**4,000/hour** (80%)|
 |Content-creating writes per minute|80/min      |**60/min** (75%)    |
@@ -509,7 +578,7 @@ The script enforces a global, multi-dimensional rate limiter shared across all w
 
 When any worker is about to exceed a window, it sleeps until the oldest event in that window ages out, then re-checks. Content limits only apply to `POST/PUT/PATCH/DELETE` requests; `GET` requests pass through unaffected by the per-minute and per-hour write windows. The reactive `X-RateLimit-Remaining` header is still inspected as a backstop, and `Retry-After` is honored on `403/429` responses that indicate a secondary rate limit was hit.
 
-The execution summary prints the limiter’s final state so you can see how close the run pushed against each ceiling:
+The execution summary prints the limiter's final state so you can see how close the run pushed against each ceiling:
 
 ```
 Rate Limits     : 1247/4000 req in last hour, 287/400 writes in last hour, 14/60 writes in last minute
@@ -522,11 +591,13 @@ Rate Limits     : 1247/4000 req in last hour, 287/400 writes in last hour, 14/60
 ```bash
 # Initial parallel run
 python script.py --apply --enterprise YOUR-ENTERPRISE \
-  --import-repo --set-teams-auto --create-teams --set-secrets --workers 5
+  --import-repo --set-teams-auto --create-teams --set-secrets \
+  --link-teams-to-workspaces --workers 5
 
 # Resume after interruption, keeping the same worker count
 python script.py --apply --enterprise YOUR-ENTERPRISE \
-  --import-repo --set-teams-auto --create-teams --set-secrets --workers 5 --continue
+  --import-repo --set-teams-auto --create-teams --set-secrets \
+  --link-teams-to-workspaces --workers 5 --continue
 ```
 
 ### Log output with multiple workers
@@ -539,8 +610,9 @@ Per-org log lines are printed atomically but may arrive out of order relative to
 
 - Veracode admin credentials are used only for API calls and never stored anywhere
 - Admin credentials must belong to a human user account with the Administrator role
-- Service account credentials are encrypted via GitHub’s public key API before being written to secrets
+- Service account credentials are encrypted via GitHub's public key API before being written to secrets
 - Agent tokens are unique per organization and regenerated on each `--set-secrets` run
+- Linking a team to a workspace grants that team visibility into the workspace's SCA scan results; no credentials are written to the org as part of this step
 - All credentials are passed via environment variables and never hardcoded in source
 - Default mode is read-only; all changes require explicit `--apply`
 
