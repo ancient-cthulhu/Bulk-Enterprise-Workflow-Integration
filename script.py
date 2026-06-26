@@ -75,19 +75,18 @@ _print_lock = threading.Lock()
 # Global rate limiter (primary + secondary GitHub limits)
 # ---------------------------------------------------------------------------
 #
-# GitHub limits this script must respect (authenticated PAT):
+# GitHub limits (authenticated PAT):
 #   Primary:    5,000 req/hour total.
 #   Secondary:  100 concurrent requests (REST + GraphQL combined).
 #   Secondary:  900 points/min per endpoint (GET=1, POST/PUT/PATCH/DELETE=5).
 #   Secondary:  80 content-creating requests/min, 500/hour (POST/PUT/PATCH/DELETE).
 #   Secondary:  90s CPU per 60s wall, plus undisclosed compute heuristics.
 #
-# In practice, content creation is the binding constraint: a full apply run
+# In practice, content creation is the binding constraint, a full apply run
 # averages ~6-7 writes per org, so 500/hour caps throughput at ~70 orgs/hour
-# regardless of workers. The limiter below uses safety margins so we never
-# brush against the actual ceilings.
+# regardless of workers.
 
-# Safety margins (fraction of GitHub's documented limits we target):
+# Safety margins:
 _SAFE_FRACTION_HOURLY = 0.80          # 4,000/hour of 5,000
 _SAFE_FRACTION_CONTENT_PER_MIN = 0.75 # 60/min of 80
 _SAFE_FRACTION_CONTENT_PER_HOUR = 0.80  # 400/hour of 500
