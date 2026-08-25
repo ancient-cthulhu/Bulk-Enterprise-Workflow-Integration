@@ -566,22 +566,17 @@ The binding constraint is not raw request throughput but GitHub's **content-crea
 
 ### Rate limit behavior with parallel workers
 
-The script enforces a global, multi-dimensional rate limiter shared across all workers. It tracks four windows simultaneously, each capped at a safety margin below GitHub's documented limits:
+The script enforces a global, multi-dimensional rate limiter shared across all workers, each dimension capped at a safety margin below GitHub's documented limit. Limits per [GitHub's REST rate limit docs](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
 
-|Window                            |GitHub limit|Script's safe target|
-|----------------------------------|------------|--------------------|
-|Primary hourly requests           |5,000/hour  |**4,000/hour** (80%)|
-|Content-creating writes per minute|80/min      |**60/min** (75%)    |
-|Content-creating writes per hour  |500/hour    |**400/hour** (80%)  |
-|Concurrent in-flight requests     |100         |**50** (50%)        |
-
-When any worker is about to exceed a window, it sleeps until the oldest event in that window ages out, then re-checks. Content limits only apply to `POST/PUT/PATCH/DELETE` requests; `GET` requests pass through unaffected by the per-minute and per-hour write windows. The reactive `X-RateLimit-Remaining` header is still inspected as a backstop, and `Retry-After` is honored on `403/429` responses that indicate a secondary rate limit was hit.
-
-The execution summary prints the limiter's final state so you can see how close the run pushed against each ceiling:
-
-```
-Rate Limits     : 1247/4000 req in last hour, 287/400 writes in last hour, 14/60 writes in last minute
-```
+|Window                            |GitHub limit          |Script's safe target|
+|----------------------------------|----------------------|--------------------|
+|Primary hourly requests           |5,000/hour            |**4,000/hour** (80%)|
+|Content-creating writes per minute|80/min                |**60/min** (75%)    |
+|Content-creating writes per hour  |500/hour              |**400/hour** (80%)  |
+|REST secondary points per minute  |900/min per endpoint  |**720/min** (80%)   |
+|GraphQL secondary points per minute|2,000/min            |**1,600/min** (80%) |
+|Concurrent in-flight requests     |100 (REST + GraphQL)  |**50** (50%)        |
+|Veracode REST requests per minute |500/min per IP        |**200/min**         |
 
 ### Checkpoint compatibility
 
@@ -602,6 +597,16 @@ python script.py --apply --enterprise YOUR-ENTERPRISE \
 ### Log output with multiple workers
 
 Per-org log lines are printed atomically but may arrive out of order relative to the org list (this is expected). The `[N/TOTAL]` progress prefix on each line shows the submission order. The audit report always contains one entry per org regardless of completion order.
+
+-----
+
+## Reliability Notes
+
+- **Git operations are bounded.** `git clone` and `git push --mirror` run with a 900s timeout (`_GIT_SUBPROCESS_TIMEOUT`). Without it a stalled connection blocks a worker thread permanently with no log line. Raise it if your integration repo is large or your link is slow.
+- **Tokens are redacted from all failure paths.** The mirror-import push URL embeds the PAT. Both the push-failure and exception paths scrub it, so it never reaches the console or `audit_report_*.json`.
+- **Post-import branch polling backs off.** Waiting for `main` to appear starts at 10s and doubles to 60s, keeping the same 15-minute ceiling while spending ~17 requests instead of ~90 per slow org.
+- **Connections are pooled per thread.** Each worker holds one `requests.Session`; cookies are blocked so behaviour matches the previous per-call requests.
+- **Duplicate reads are avoided.** `--fix-repos` reads `GET /repos/{org}/{repo}` once per org instead of three times, and reuses the `veracode.yml` response it already fetched rather than re-fetching it before writing.
 
 -----
 
