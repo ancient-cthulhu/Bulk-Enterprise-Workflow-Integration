@@ -5,6 +5,7 @@ import csv
 import functools
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -17,7 +18,9 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from http import cookiejar
 from pathlib import Path
 from typing import Any, Literal
 
@@ -74,17 +77,8 @@ _print_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 # Global rate limiter (primary + secondary GitHub limits)
 # ---------------------------------------------------------------------------
-#
-# GitHub limits (authenticated PAT):
-#   Primary:    5,000 req/hour total.
-#   Secondary:  100 concurrent requests (REST + GraphQL combined).
-#   Secondary:  900 points/min per endpoint (GET=1, POST/PUT/PATCH/DELETE=5).
-#   Secondary:  80 content-creating requests/min, 500/hour (POST/PUT/PATCH/DELETE).
-#   Secondary:  90s CPU per 60s wall, plus undisclosed compute heuristics.
-#
-# In practice, content creation is the binding constraint, a full apply run
-# averages ~6-7 writes per org, so 500/hour caps throughput at ~70 orgs/hour
-# regardless of workers.
+# See README "Rate Limits" for the full budget table and what is / is not
+# modelled proactively.
 
 # Safety margins:
 _SAFE_FRACTION_HOURLY = 0.80          # 4,000/hour of 5,000
@@ -92,8 +86,26 @@ _SAFE_FRACTION_CONTENT_PER_MIN = 0.75 # 60/min of 80
 _SAFE_FRACTION_CONTENT_PER_HOUR = 0.80  # 400/hour of 500
 _SAFE_FRACTION_POINTS_PER_MIN = 0.80  # 720 points/min of 900
 
-# Concurrent in-flight cap (GitHub says 100; we cap workers to 10 already)
+# Secondary-limit point costs (README: Rate Limits).
+_POINTS_LIMIT_REST_PER_MIN = 900
+_POINTS_LIMIT_GRAPHQL_PER_MIN = 2000
+_POINT_COST_READ = 1
+_POINT_COST_WRITE = 5
+
+# Backstop against GitHub's 100 concurrent limit. --workers is not hard-capped.
 _MAX_CONCURRENT_REQUESTS = 50
+
+_MAX_BACKOFF_SLEEP_SECONDS = 300    # cap on any single backoff sleep
+_MAX_RATE_LIMIT_TOTAL_WAIT = 3900   # cap on total wait for a window reset
+_MAX_BRANCH_POLL_INTERVAL = 60      # ceiling for post-import branch poll backoff
+
+_RATE_LIMIT_MAX_ATTEMPTS = 6        # rate-limit retries; 5xx/network use max_retries
+
+# Veracode REST is 500/min per IP; we pace off 250 (README: Rate Limits).
+_VERACODE_REST_LIMIT_PER_MIN = 500
+_VERACODE_PACE_BASE_PER_MIN = 250
+_VERACODE_SAFE_FRACTION_PER_MIN = 0.80  # 200/min
+_VERACODE_MAX_CONCURRENT_REQUESTS = 4
 
 _CONTENT_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
@@ -135,6 +147,41 @@ class _SlidingWindow:
             return self._events[0] if self._events else None
 
 
+class _WeightedSlidingWindow:
+    """Sliding window where each event carries a point cost; count() sums costs."""
+    __slots__ = ("window", "_events", "_total", "_lock")
+
+    def __init__(self, window_seconds: float) -> None:
+        self.window = window_seconds
+        self._events: deque[tuple[float, int]] = deque()
+        self._total = 0
+        self._lock = threading.Lock()
+
+    def _prune_locked(self, cutoff: float) -> None:
+        events = self._events
+        while events and events[0][0] < cutoff:
+            self._total -= events.popleft()[1]
+
+    def add(self, points: int) -> None:
+        now = time.time()
+        with self._lock:
+            self._events.append((now, points))
+            self._total += points
+            self._prune_locked(now - self.window)
+
+    def count(self) -> int:
+        cutoff = time.time() - self.window
+        with self._lock:
+            self._prune_locked(cutoff)
+            return self._total
+
+    def oldest_in_window(self) -> float | None:
+        cutoff = time.time() - self.window
+        with self._lock:
+            self._prune_locked(cutoff)
+            return self._events[0][0] if self._events else None
+
+
 class _RateLimiter:
     """
     Global rate limiter shared across worker threads.
@@ -148,11 +195,20 @@ class _RateLimiter:
         self.hourly = _SlidingWindow(3600)
         self.content_minute = _SlidingWindow(60)
         self.content_hour = _SlidingWindow(3600)
+        self.points_minute = _WeightedSlidingWindow(60)
+        self.graphql_points_minute = _WeightedSlidingWindow(60)
         self.concurrent = threading.Semaphore(_MAX_CONCURRENT_REQUESTS)
 
         self.hourly_cap = int(5000 * _SAFE_FRACTION_HOURLY)
         self.content_min_cap = int(80 * _SAFE_FRACTION_CONTENT_PER_MIN)
         self.content_hour_cap = int(500 * _SAFE_FRACTION_CONTENT_PER_HOUR)
+        self.points_min_cap = int(_POINTS_LIMIT_REST_PER_MIN * _SAFE_FRACTION_POINTS_PER_MIN)
+        self.graphql_points_min_cap = int(
+            _POINTS_LIMIT_GRAPHQL_PER_MIN * _SAFE_FRACTION_POINTS_PER_MIN
+        )
+        # Guards hourly_cap, which observe_limit re-derives from the token's
+        # real limit once the first response header arrives.
+        self._limit_lock = threading.Lock()
 
         self._warn_lock = threading.Lock()
         self._last_warn_ts: float = 0.0
@@ -165,9 +221,23 @@ class _RateLimiter:
             self._last_warn_ts = now
         tprint(msg)
 
-    def acquire(self, method: str) -> None:
-        """Block until safe to make a request of the given method."""
-        is_content = method.upper() in _CONTENT_METHODS
+    def acquire(self, method: str, graphql: bool = False) -> None:
+        """Block until safe. `graphql` bills to the GraphQL bucket, not REST
+        content-creation, even though it is an HTTP POST.
+
+        Caps are checked then incremented without a lock across both steps, so
+        N workers can overshoot by at most N-1. The 0.75-0.80 safety fractions
+        absorb that.
+        """
+        is_content = (not graphql) and method.upper() in _CONTENT_METHODS
+        points = _POINT_COST_WRITE if method.upper() in _CONTENT_METHODS else _POINT_COST_READ
+        if graphql:
+            # Non-mutating GraphQL queries cost 1 point. This tool issues only
+            # queries over GraphQL; if a mutation is ever added, charge 5.
+            points = _POINT_COST_READ
+        points_window = self.graphql_points_minute if graphql else self.points_minute
+        points_cap = self.graphql_points_min_cap if graphql else self.points_min_cap
+        points_label = "GraphQL" if graphql else "REST"
 
         # Hourly primary budget
         while True:
@@ -200,14 +270,45 @@ class _RateLimiter:
                            f"({self.content_hour_cap}/hour). Waiting {int(wait)}s.")
                 time.sleep(min(wait, 60))
 
+        # Per-minute secondary points budget (REST and GraphQL are separate
+        # buckets; see _POINTS_LIMIT_* above).
+        while True:
+            if points_window.count() + points <= points_cap:
+                break
+            oldest = points_window.oldest_in_window()
+            wait = max((oldest + 60) - time.time(), 1.0) if oldest else 2.0
+            self._warn(f"  [RATE LIMIT] {points_label} points-per-minute budget reached "
+                       f"({points_cap} points/min). Pacing for {wait:.1f}s.")
+            time.sleep(min(wait, 10))
+
         self.concurrent.acquire()
         self.hourly.add()
+        points_window.add(points)
         if is_content:
             self.content_minute.add()
             self.content_hour.add()
 
     def release(self) -> None:
         self.concurrent.release()
+
+    def observe_limit(self, limit: int, resource: str | None) -> None:
+        """
+        Re-derive the hourly cap from x-ratelimit-limit. No-op for a PAT on
+        github.com (5000*0.8 == the 4000 default); only moves on --api-base
+        (GHES), where the site admin sets the limit. 'core' resource only.
+        """
+        if limit <= 0:
+            return
+        if resource is not None and resource != "core":
+            return
+        new_cap = int(limit * _SAFE_FRACTION_HOURLY)
+        with self._limit_lock:
+            if new_cap == self.hourly_cap:
+                return
+            old_cap = self.hourly_cap
+            self.hourly_cap = new_cap
+        tprint(f"  [INFO] Adjusting hourly budget to {new_cap} "
+               f"(GitHub reports a limit of {limit} for this token; was {old_cap}).")
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -217,10 +318,68 @@ class _RateLimiter:
             "content_min_cap": self.content_min_cap,
             "content_writes_last_hour": self.content_hour.count(),
             "content_hour_cap": self.content_hour_cap,
+            "points_last_minute": self.points_minute.count(),
+            "points_min_cap": self.points_min_cap,
+            "graphql_points_last_minute": self.graphql_points_minute.count(),
+            "graphql_points_min_cap": self.graphql_points_min_cap,
+        }
+
+
+class _VeracodeRateLimiter:
+    """Proactive pacing for Veracode REST. Separate counters from GitHub's."""
+    def __init__(self) -> None:
+        self.minute = _SlidingWindow(60)
+        self.minute_cap = int(_VERACODE_PACE_BASE_PER_MIN * _VERACODE_SAFE_FRACTION_PER_MIN)
+        self.concurrent = threading.Semaphore(_VERACODE_MAX_CONCURRENT_REQUESTS)
+
+        self._total_lock = threading.Lock()
+        self._total = 0
+
+        self._warn_lock = threading.Lock()
+        self._last_warn_ts: float = 0.0
+
+    def _warn(self, msg: str) -> None:
+        now = time.time()
+        with self._warn_lock:
+            if now - self._last_warn_ts < 10:
+                return
+            self._last_warn_ts = now
+        tprint(msg)
+
+    def acquire(self) -> None:
+        while True:
+            if self.minute.count() < self.minute_cap:
+                break
+            oldest = self.minute.oldest_in_window()
+            wait = max((oldest + 60) - time.time(), 1.0) if oldest else 2.0
+            self._warn(f"  [RATE LIMIT] Veracode minute budget reached "
+                       f"({self.minute_cap}/min). Pacing for {wait:.1f}s.")
+            time.sleep(min(wait, 10))
+
+        self.concurrent.acquire()
+        self.minute.add()
+        with self._total_lock:
+            self._total += 1
+
+    def release(self) -> None:
+        self.concurrent.release()
+
+    @property
+    def total_requests(self) -> int:
+        with self._total_lock:
+            return self._total
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "requests_last_minute": self.minute.count(),
+            "minute_cap": self.minute_cap,
+            "total_requests": self.total_requests,
+            "documented_rest_limit_per_min": _VERACODE_REST_LIMIT_PER_MIN,
         }
 
 
 _rate_limiter = _RateLimiter()
+_veracode_rate_limiter = _VeracodeRateLimiter()
 
 
 # ---------------------------------------------------------------------------
@@ -281,12 +440,6 @@ class ProgressDisplay:
             return
         pct = (idx / total * 100) if total else 100.0
         tprint(f"  --> [{idx}/{total} ({pct:.1f}%)] starting: {org}")
-
-    def update(self, slot_id: int, org: str, elapsed: float) -> None:
-        pass
-
-    def update_slots_and_redraw(self, updates: dict[int, tuple[str, float]]) -> None:
-        pass
 
     def clear_slot(self, slot_id: int) -> None:
         pass
@@ -431,6 +584,16 @@ def check_rate_limit(response: requests.Response) -> None:
     """
     remaining_hdr = response.headers.get("X-RateLimit-Remaining")
     reset_hdr = response.headers.get("X-RateLimit-Reset")
+
+    limit_hdr = response.headers.get("X-RateLimit-Limit")
+    if limit_hdr:
+        try:
+            _rate_limiter.observe_limit(
+                int(limit_hdr), response.headers.get("X-RateLimit-Resource")
+            )
+        except ValueError:
+            pass
+
     if not remaining_hdr or not reset_hdr:
         return
 
@@ -444,18 +607,112 @@ def check_rate_limit(response: requests.Response) -> None:
         reset_dt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reset_time))
         tprint(f"  [INFO] Primary rate limit: {remaining} requests remaining (resets at {reset_dt})")
 
-    # Hard backstop: GitHub says we're almost out. Pause until reset.
+    # Backstop: loop and re-check against x-ratelimit-reset rather than
+    # proceeding after one truncated sleep. Total wait is bounded so a bogus
+    # reset header cannot wedge the process.
     if remaining < 50:
-        wait_seconds = max(reset_time - int(time.time()), 0) + 5
-        if wait_seconds > 0:
+        deadline = time.time() + _MAX_RATE_LIMIT_TOTAL_WAIT
+        while True:
+            until_reset = reset_time - int(time.time())
+            if until_reset <= 0:
+                break
+            if time.time() >= deadline:
+                tprint(f"  [RATE LIMIT] x-ratelimit-reset is still {until_reset}s out after waiting "
+                       f"{_MAX_RATE_LIMIT_TOTAL_WAIT}s; treating it as unreliable and continuing.")
+                break
+            wait_seconds = until_reset + 5
             tprint(f"  [RATE LIMIT] GitHub reports {remaining} remaining; sleeping {wait_seconds}s "
                    f"until window reset to be safe.")
-            time.sleep(min(wait_seconds, 300))
+            time.sleep(min(wait_seconds, _MAX_BACKOFF_SLEEP_SECONDS))
 
 
 # ---------------------------------------------------------------------------
 # Unified retry core
 # ---------------------------------------------------------------------------
+
+def parse_retry_after(headers: Any, default: int = 60) -> int:
+    """Parse Retry-After as delay-seconds or HTTP-date. Falls back to `default`."""
+    raw = None
+    try:
+        raw = headers.get("Retry-After")
+        if raw is None:
+            raw = headers.get("retry-after")
+    except AttributeError:
+        return default
+    if raw is None:
+        return default
+
+    raw = str(raw).strip()
+    if not raw:
+        return default
+
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        pass
+
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError):
+        return default
+    if when is None:
+        return default
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(int((when - datetime.now(timezone.utc)).total_seconds()), 0)
+
+
+def _is_primary_rate_limited(r: requests.Response) -> bool:
+    """403/429 with x-ratelimit-remaining 0 is primary exhaustion, not a perms error."""
+    if r.status_code not in (403, 429):
+        return False
+    remaining = r.headers.get("X-RateLimit-Remaining") or r.headers.get("x-ratelimit-remaining")
+    if remaining is not None:
+        try:
+            if int(remaining) <= 0:
+                return True
+        except ValueError:
+            pass
+    return "api rate limit exceeded" in (r.text or "").lower()
+
+
+def _rate_limit_wait(r: requests.Response, rl_attempt: int) -> float:
+    """Wait before retrying a rate-limited response.
+
+    Precedence per GitHub docs: Retry-After, then x-ratelimit-reset but only
+    when remaining is 0, else a 60s floor. Escalates 2**attempt, capped, with
+    upward-only jitter so the wait is never below what the server asked for.
+    """
+    base = float(parse_retry_after(r.headers, default=0))
+
+    if base <= 0:
+        remaining_hdr = (r.headers.get("X-RateLimit-Remaining")
+                         or r.headers.get("x-ratelimit-remaining"))
+        reset_hdr = r.headers.get("X-RateLimit-Reset") or r.headers.get("x-ratelimit-reset")
+        exhausted = False
+        if remaining_hdr is not None:
+            try:
+                exhausted = int(remaining_hdr) <= 0
+            except ValueError:
+                exhausted = False
+        if exhausted and reset_hdr:
+            try:
+                base = (int(reset_hdr) - time.time()) + 5
+            except ValueError:
+                base = 0.0
+
+    if base <= 0:
+        base = 60.0
+
+    escalated = min(base * (2 ** rl_attempt), float(_MAX_BACKOFF_SLEEP_SECONDS))
+    return escalated + random.uniform(0, min(escalated * 0.25, 5.0))
+
+
+def _fault_backoff(attempt: int) -> float:
+    """Backoff for 5xx and network faults, with full upward jitter."""
+    base = float((2 ** attempt) * 2)
+    return base + random.uniform(0, base)
+
 
 def _retry_request(
     make_request: Callable[[], requests.Response],
@@ -464,7 +721,10 @@ def _retry_request(
 ) -> requests.Response:
     if max_retries < 1:
         raise ValueError(f"max_retries must be >= 1, got {max_retries}")
-    for attempt in range(max_retries):
+    rate_limit_attempts = max(max_retries, _RATE_LIMIT_MAX_ATTEMPTS)
+    attempt = 0
+    rl_attempt = 0
+    while True:
         try:
             r = make_request()
 
@@ -472,44 +732,110 @@ def _retry_request(
                 r.status_code in (403, 429)
                 and "secondary rate limit" in (r.text or "").lower()
             )
+            is_primary = (not is_secondary) and _is_primary_rate_limited(r)
 
-            if r.status_code == 429 or is_secondary:
-                retry_after = int(r.headers.get("Retry-After", 60))
-                if attempt < max_retries - 1:
-                    kind = "secondary rate limit" if is_secondary else "429"
-                    tprint(f"  [{label}] {kind}, waiting {retry_after}s (retry {attempt + 1}/{max_retries})...")
-                    time.sleep(retry_after)
+            if r.status_code == 429 or is_secondary or is_primary:
+                if rl_attempt < rate_limit_attempts - 1:
+                    wait = _rate_limit_wait(r, rl_attempt)
+                    if is_secondary:
+                        kind = "secondary rate limit"
+                    elif is_primary:
+                        kind = "primary rate limit"
+                    else:
+                        kind = "429"
+                    tprint(f"  [{label}] {kind}, waiting {wait:.0f}s "
+                           f"(retry {rl_attempt + 1}/{rate_limit_attempts})...")
+                    time.sleep(wait)
+                    rl_attempt += 1
                     continue
                 return r
             if r.status_code >= 500:
                 if attempt < max_retries - 1:
-                    wait = (2 ** attempt) * 2
-                    tprint(f"  [{label}] {r.status_code}, waiting {wait}s (retry {attempt + 1}/{max_retries})...")
+                    wait = _fault_backoff(attempt)
+                    tprint(f"  [{label}] {r.status_code}, waiting {wait:.0f}s (retry {attempt + 1}/{max_retries})...")
                     time.sleep(wait)
+                    attempt += 1
                     continue
                 return r
             return r
         except (requests.exceptions.Timeout, requests.exceptions.RequestException) as exc:
             if attempt < max_retries - 1:
-                wait = (2 ** attempt) * 2
+                wait = _fault_backoff(attempt)
                 label_exc = "timeout" if isinstance(exc, requests.exceptions.Timeout) else str(exc)[:50]
-                tprint(f"  [{label}] {label_exc}, waiting {wait}s (retry {attempt + 1}/{max_retries})...")
+                tprint(f"  [{label}] {label_exc}, waiting {wait:.0f}s (retry {attempt + 1}/{max_retries})...")
                 time.sleep(wait)
+                attempt += 1
                 continue
             raise
-    assert False, "unreachable"  # pragma: no cover
 
 
-def request(method: str, url: str, token: str, max_retries: int = 3, **kwargs: Any) -> requests.Response:
+_thread_local = threading.local()
+
+
+class _BlockAllCookies(cookiejar.DefaultCookiePolicy):
+    """Accept and return no cookies (matches the old per-call session behaviour)."""
+    def set_ok(self, cookie: Any, request: Any) -> bool:
+        return False
+
+    def return_ok(self, cookie: Any, request: Any) -> bool:
+        return False
+
+
+def _session() -> requests.Session:
+    """One Session per thread: pooled connections, no cross-thread sharing.
+    Cookies blocked so behaviour matches the old per-call requests.request().
+    """
+    sess = getattr(_thread_local, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        sess.cookies.set_policy(_BlockAllCookies())
+        _thread_local.session = sess
+    return sess
+
+
+def request(
+    method: str,
+    url: str,
+    token: str,
+    max_retries: int = 3,
+    *,
+    graphql: bool = False,
+    **kwargs: Any,
+) -> requests.Response:
+    """`graphql=True` bills to the GraphQL bucket, skips content-creation
+    accounting, and skips check_rate_limit (its headers are GraphQL-bucket
+    values, not REST primary).
+    """
+    headers = gh_headers(token)
+
     def make() -> requests.Response:
-        _rate_limiter.acquire(method)
+        _rate_limiter.acquire(method, graphql=graphql)
         try:
-            r = requests.request(method, url, headers=gh_headers(token), timeout=45, **kwargs)
+            r = _session().request(method, url, headers=headers, timeout=45, **kwargs)
         finally:
             _rate_limiter.release()
-        check_rate_limit(r)
+        if not graphql:
+            check_rate_limit(r)
         return r
     return _retry_request(make, "GITHUB", max_retries)
+
+
+def _veracode_auth(api_id: str, api_key: str) -> Any:
+    """HMAC auth cached per credential pair per thread (not shared: the plugin
+    signs each request and is not documented thread-safe). Import stays local so
+    the "not installed" error still surfaces at first Veracode use.
+    """
+    cache = getattr(_thread_local, "veracode_auth", None)
+    if cache is None:
+        cache = {}
+        _thread_local.veracode_auth = cache
+    key = (api_id, api_key)
+    auth = cache.get(key)
+    if auth is None:
+        from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
+        auth = RequestsAuthPluginVeracodeHMAC(api_key_id=api_id, api_key_secret=api_key)
+        cache[key] = auth
+    return auth
 
 
 def veracode_request(
@@ -520,12 +846,15 @@ def veracode_request(
     max_retries: int = 3,
     **kwargs: Any,
 ) -> requests.Response:
-    from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
     url = f"https://api.veracode.com{endpoint}"
-    auth = RequestsAuthPluginVeracodeHMAC(api_key_id=api_id, api_key_secret=api_key)
+    auth = _veracode_auth(api_id, api_key)
 
     def make() -> requests.Response:
-        return requests.request(method, url, auth=auth, timeout=45, **kwargs)
+        _veracode_rate_limiter.acquire()
+        try:
+            return _session().request(method, url, auth=auth, timeout=45, **kwargs)
+        finally:
+            _veracode_rate_limiter.release()
     return _retry_request(make, "VERACODE", max_retries)
 
 
@@ -609,6 +938,10 @@ def write_orgs_txt(path: Path, orgs: list[str]) -> None:
 # Git helpers
 # ---------------------------------------------------------------------------
 
+# Ceiling for a git clone or push; without it a stall blocks a worker forever.
+_GIT_SUBPROCESS_TIMEOUT = 900
+
+
 @functools.lru_cache(maxsize=1)
 def check_git_available() -> bool:
     try:
@@ -625,13 +958,15 @@ def git_clone_bare(source_url: str) -> tuple[bool, str, str | None]:
         bare_repo = os.path.join(temp_dir, "repo.git")
         result = subprocess.run(
             ["git", "clone", "--bare", source_url, bare_repo],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=_GIT_SUBPROCESS_TIMEOUT,
         )
         if result.returncode != 0:
             return False, f"Clone failed: {result.stderr}", None
         out = temp_dir
         temp_dir = None
         return True, "Clone successful", out
+    except subprocess.TimeoutExpired:
+        return False, f"Clone timed out after {_GIT_SUBPROCESS_TIMEOUT}s", None
     except Exception as exc:
         return False, str(exc), None
     finally:
@@ -657,7 +992,7 @@ def git_mirror_import(
         else:
             clone_result = subprocess.run(
                 ["git", "clone", "--bare", source_url, bare_repo],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=_GIT_SUBPROCESS_TIMEOUT,
             )
             if clone_result.returncode != 0:
                 return False, f"Clone failed: {clone_result.stderr}"
@@ -675,6 +1010,7 @@ def git_mirror_import(
                 "push", "--mirror", target_url,
             ],
             capture_output=True, text=True, env=push_env,
+            timeout=_GIT_SUBPROCESS_TIMEOUT,
         )
         if push_result.returncode != 0:
             safe_stderr = push_result.stderr.replace(token, "***")
@@ -682,8 +1018,12 @@ def git_mirror_import(
 
         return True, "Import successful"
 
+    except subprocess.TimeoutExpired as exc:
+        # exc echoes the command line, which carries the token in the push URL.
+        stage = "Push" if "push" in (exc.cmd or []) else "Clone"
+        return False, f"{stage} timed out after {_GIT_SUBPROCESS_TIMEOUT}s"
     except Exception as exc:
-        return False, str(exc)
+        return False, str(exc).replace(token, "***")
     finally:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -748,7 +1088,7 @@ def create_veracode_workspace(
             log(f"  [ERROR] Failed to create workspace: {r.status_code} - {r.text[:200]}")
             return None
 
-        for attempt in range(3):
+        for _ in range(3):
             workspace_id = _find_workspace_by_name(org_name, api_id, api_key, log)
             if workspace_id:
                 return workspace_id
@@ -901,7 +1241,7 @@ def create_veracode_team(
             log(f"  [ERROR] Failed to create team '{team_name}': {r.status_code} - {r.text[:200]}")
             return None
 
-        for attempt in range(3):
+        for _ in range(3):
             tid = _find_veracode_team_by_name(team_name, api_id, api_key, log)
             if tid:
                 return tid
@@ -1142,14 +1482,16 @@ def set_default_branch(
     token: str,
     branch: str = "main",
     log: Callable[[str], None] = tprint,
+    current_branch: str | None = None,
 ) -> tuple[bool, str]:
     """
     Set the default branch for a repo.
     Returns (success, action) where action is one of:
     'already_main', 'set_to_main', 'branch_not_found' (caller should re-import),
     'failed'.
+    `current_branch`: pass a already-read default_branch to skip a duplicate GET.
     """
-    current = get_repo_default_branch(api_base, org, repo, token)
+    current = current_branch if current_branch is not None else get_repo_default_branch(api_base, org, repo, token)
     if current is None:
         log(f"  [{org}] Could not read default_branch for {repo}")
         return False, "failed"
@@ -1202,7 +1544,7 @@ def check_and_fix_default_branch(
             return False, "branch_not_found"
         log(f"  [{org}] Default branch is '{current}' (not 'main') - would fix in apply mode")
         return False, f"needs_fix:{current}"
-    return set_default_branch(api_base, org, repo, token, "main", log)
+    return set_default_branch(api_base, org, repo, token, "main", log, current_branch=current)
 
 
 # ---------------------------------------------------------------------------
@@ -1252,7 +1594,13 @@ def check_repo_health(
 
     # --- Default branch -------------------------------------------------------
     db_ok, db_action = check_and_fix_default_branch(api_base, org, repo, token, dry_run, log)
-    result.default_branch = get_repo_default_branch(api_base, org, repo, token)
+    # Only re-read when the outcome leaves the branch genuinely unknown.
+    if db_action in ("already_main", "set_to_main"):
+        result.default_branch = "main"
+    elif db_action == "read_failed":
+        result.default_branch = None
+    else:
+        result.default_branch = get_repo_default_branch(api_base, org, repo, token)
     result.default_branch_ok = db_ok
     result.default_branch_action = db_action
     if not db_ok:
@@ -1294,7 +1642,10 @@ def check_repo_health(
                 return result
 
             db_ok, db_action = set_default_branch(api_base, org, repo, token, "main", log)
-            result.default_branch = get_repo_default_branch(api_base, org, repo, token)
+            if db_action in ("already_main", "set_to_main"):
+                result.default_branch = "main"
+            else:
+                result.default_branch = get_repo_default_branch(api_base, org, repo, token)
             result.default_branch_ok = db_ok
             result.default_branch_action = db_action
             result.reimport_action = "reimported"
@@ -1312,6 +1663,7 @@ def check_repo_health(
             yml_ok, yml_action = _put_veracode_yml_with_backup(
                 api_base, org, repo, token, effective_yml,
                 update_message="Add missing veracode.yml during fix-repos remediation",
+                preread=r,
             )
             result.veracode_yml_action = yml_action if yml_ok else f"failed:{yml_action}"
             log(f"  [{org}] veracode.yml: {result.veracode_yml_action}")
@@ -1322,6 +1674,7 @@ def check_repo_health(
         yml_ok, yml_action = _put_veracode_yml_with_backup(
             api_base, org, repo, token, yml_content,
             update_message="Update veracode.yml during fix-repos remediation",
+            preread=r,
         )
         result.veracode_yml_action = yml_action if yml_ok else f"failed:{yml_action}"
     else:
@@ -1472,11 +1825,14 @@ def _put_veracode_yml_with_backup(
     token: str,
     yml_content: str,
     update_message: str = "Update veracode.yml with new configuration",
+    preread: requests.Response | None = None,
 ) -> tuple[bool, str]:
+    """`preread`: reuse an existing GET of this same URL at ref=main (its sha is
+    used for the update). Only valid if no write happened in between."""
     veracode_url = f"{api_base}/repos/{org}/{repo}/contents/veracode.yml"
     default_veracode_url = f"{api_base}/repos/{org}/{repo}/contents/default-veracode.yml"
 
-    r = request("GET", veracode_url, token, params={"ref": "main"})
+    r = preread if preread is not None else request("GET", veracode_url, token, params={"ref": "main"})
     if r.status_code == 200:
         original_data = r.json()
         original_sha = original_data.get("sha")
@@ -1517,21 +1873,28 @@ def fetch_upstream_veracode_yml() -> str | None:
         f"{INTEGRATION_SOURCE_URL.removeprefix('https://github.com/').removesuffix('.git')}"
         f"/main/veracode.yml"
     )
+    # Different host, own budget: not routed through the GitHub limiter.
     for attempt in range(3):
         try:
-            r = requests.get(url, timeout=30)
+            r = _session().get(url, timeout=30)
             if r.status_code == 200:
                 return r.text
+            if r.status_code == 429:
+                wait = parse_retry_after(r.headers)
+                print(f"  [WARNING] Upstream rate limited (429), waiting {wait}s, attempt {attempt + 1}/3", file=sys.stderr)
+                if attempt < 2:
+                    time.sleep(min(wait, _MAX_BACKOFF_SLEEP_SECONDS) + random.uniform(0, 2))
+                continue
             if r.status_code < 500:
                 print(f"  [ERROR] Failed to fetch upstream veracode.yml: HTTP {r.status_code}", file=sys.stderr)
                 return None
             print(f"  [WARNING] Upstream returned {r.status_code}, attempt {attempt + 1}/3", file=sys.stderr)
             if attempt < 2:
-                time.sleep((2 ** attempt) * 2)
+                time.sleep(_fault_backoff(attempt))
         except requests.exceptions.RequestException as exc:
             print(f"  [WARNING] Network error fetching upstream veracode.yml: {exc}, attempt {attempt + 1}/3", file=sys.stderr)
             if attempt < 2:
-                time.sleep((2 ** attempt) * 2)
+                time.sleep(_fault_backoff(attempt))
     print("  [ERROR] Failed to fetch upstream veracode.yml after 3 attempts", file=sys.stderr)
     return None
 
@@ -1595,7 +1958,7 @@ def list_orgs_graphql(api_base: str, token: str, enterprise: str) -> list[str] |
             variables: dict[str, Any] = {"enterprise": enterprise}
             if cursor:
                 variables["cursor"] = cursor
-            r = request("POST", graphql_url, token, json={"query": query, "variables": variables})
+            r = request("POST", graphql_url, token, json={"query": query, "variables": variables}, graphql=True)
             if r.status_code != 200:
                 return None
             data = r.json()
@@ -1729,19 +2092,23 @@ def wait_for_main_branch(
     poll_interval: int = 10,
     log: Callable[[str], None] = tprint,
 ) -> bool:
-    deadline = time.time() + timeout
-    attempt = 0
+    """Poll for 'main' after import. Interval doubles to _MAX_BRANCH_POLL_INTERVAL:
+    a flat 10s poll costs up to 90 requests per slow org, backoff costs ~17.
+    """
+    start = time.time()
+    deadline = start + timeout
+    interval = float(poll_interval)
     while time.time() < deadline:
         if check_main_branch_exists(api_base, org, repo, token):
             return True
         remaining = deadline - time.time()
         if remaining <= 0:
             break
-        sleep = min(poll_interval, remaining)
-        log(f"  [{org}] Waiting for main branch... ({attempt * poll_interval}s elapsed, "
+        sleep = min(interval, remaining)
+        log(f"  [{org}] Waiting for main branch... ({int(time.time() - start)}s elapsed, "
             f"up to {int(remaining)}s remaining)")
         time.sleep(sleep)
-        attempt += 1
+        interval = min(interval * 2, float(_MAX_BRANCH_POLL_INTERVAL))
     return False
 
 
@@ -2369,7 +2736,7 @@ def process_org(
     # --- Link team to SCA workspace (independent, idempotent) -----------------
     if ctx.do_link_teams and teams_value and ctx.veracode_api_id and ctx.veracode_api_key:
         try:
-            link_ok, link_action = ensure_team_linked_to_workspace(
+            _link_ok, link_action = ensure_team_linked_to_workspace(
                 org_name=org,
                 team_name=teams_value,
                 api_id=ctx.veracode_api_id,
@@ -3040,6 +3407,11 @@ def main() -> None:
     print(f"Rate Limits     : {snap['requests_last_hour']}/{snap['hourly_cap']} req in last hour, "
           f"{snap['content_writes_last_hour']}/{snap['content_hour_cap']} writes in last hour, "
           f"{snap['content_writes_last_minute']}/{snap['content_min_cap']} writes in last minute")
+
+    vc_snap = _veracode_rate_limiter.snapshot()
+    if vc_snap["total_requests"]:
+        print(f"Veracode Limits : {vc_snap['requests_last_minute']}/{vc_snap['minute_cap']} req in last minute, "
+              f"{vc_snap['total_requests']} total this run")
 
     print(f"{'=' * 70}")
     print("\nOutputs written to:", outdir.resolve())
