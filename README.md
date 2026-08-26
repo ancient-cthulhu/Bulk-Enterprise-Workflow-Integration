@@ -263,10 +263,6 @@ The flag creates neither the workspace nor the team. It resolves:
 
 then issues an idempotent association. Re-running is safe and reports `already_linked` for teams already on the workspace.
 
-### Endpoint note
-
-Confirm the endpoint against the SCA Agent API specification for your tenant before a fleet-wide run. The script uses `PUT /srcclr/v3/workspaces/{workspace_id}/teams/{team_id}`, following the existing `/srcclr/v3/workspaces/{id}/...` convention used elsewhere in the script. The path is isolated in a single helper so it is trivial to adjust if your tenant's spec differs.
-
 ### Credential requirements
 
 Requires `VERACODE_API_ID` and `VERACODE_API_KEY` (human user account with the Administrator role). It does not use the service account credentials. Must be combined with one of the `--set-teams-*` flags so the script knows which team name to resolve per org. Running it with no teams mode active is rejected at startup.
